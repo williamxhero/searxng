@@ -4,6 +4,7 @@
 import hashlib
 import json
 import os
+from collections.abc import Mapping
 from pathlib import Path
 import socket
 import sqlite3
@@ -1370,7 +1371,11 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
             session.stop_sender(binding)
             proof = session.seal()
             before = (root / 'ledger.sqlite').read_bytes()
-            clock = dict(self.now)
+            clock: FixtureClock = {
+                'wall': self.now['wall'],
+                'mono': self.now['mono'],
+                'boot': self.now['boot'],
+            }
             self.advance(300)
             refused = self.api.recover(root, authorization=authorization, decision='combined', proof=proof)
             assert isinstance(refused, self.api.Refusal)
@@ -1465,8 +1470,15 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
             proof = session.seal()
             before = (root / 'ledger.sqlite').read_bytes()
             approved = proof.approved_manifest
+            assert isinstance(approved, Mapping)
+            assert isinstance(approved['registry'], tuple)
+            assert isinstance(approved['registry'][0], Mapping)
+            assert isinstance(approved['registry'][0]['profile'], Mapping)
             with self.assertRaises(TypeError):
-                approved['registry'][0]['profile']['live_hold'] = True
+                exec("approved['registry'][0]['profile']['live_hold'] = True", {}, {'approved': approved})
+            assert isinstance(manifest['registry'], list)
+            assert isinstance(manifest['registry'][0], dict)
+            assert isinstance(manifest['registry'][0]['profile'], dict)
             manifest['config_digest'] = 'b' * 64
             manifest['registry'][0]['profile']['live_hold'] = True
             self.assertEqual(approved['config_digest'], 'a' * 64)
