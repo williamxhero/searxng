@@ -126,6 +126,337 @@ class StoreTest(unittest.TestCase):
     def open(self):
         return self.api.open_store(self.root, manifest=self.manifest, mode='synthetic')
 
+    def legacy_fixture(self, name='legacy-state', *, unfinished=False, poison=()):
+        root = Path(self.parent.name) / name
+        root.mkdir(mode=0o700)
+        identity = b'1' * 32  # Disposable synthetic token, never a copied live identity.
+        for path, data in [(root / 'identity', identity), (Path(str(root) + '.identity'), identity),
+                           (root / 'lock', b''), (root / 'ledger.sqlite', b'')]:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, 'wb') as file:
+                file.write(data)
+        checkpoint = json.dumps({'wall': 10000.0, 'mono': 8073000.0, 'boot': self.boot})
+        self.now.update(wall=10001.0, mono=8073001.0)
+        with sqlite3.connect(root / 'ledger.sqlite') as db:
+            # Original probe source lines522–527; no v2 DDL or production copy.
+            db.execute('CREATE TABLE state (id TEXT, root TEXT, checkpoint TEXT)')
+            db.execute('CREATE TABLE attempts (engine TEXT, domestic INTEGER, stamp REAL, outcome TEXT)')
+            db.execute('CREATE TABLE pauses (engine TEXT PRIMARY KEY, strikes INTEGER, until REAL)')
+            db.execute('CREATE TABLE poison (reason TEXT)')
+            db.execute('INSERT INTO state VALUES (?,?,?)', (identity.decode(), str(root), checkpoint))
+            db.executemany('INSERT INTO attempts(rowid,engine,domestic,stamp,outcome) VALUES (?,?,?,?,?)', [
+                (7, 'chinaso news', 1, 8072913.0, 'ok'),
+                (19, 'chinaso news', 1, 8072914.25, 'ok'),
+                (41, 'quark', 1, 8072915.728828768, 'captcha'),
+            ])
+            if unfinished:
+                db.execute('INSERT INTO attempts(rowid,engine,domestic,stamp,outcome) VALUES (53,?,?,?,NULL)',
+                           ('bing', 0, 8072999.0))
+            db.execute('INSERT INTO pauses VALUES (?,?,?)', ('quark', 1, 8074715.728828768))
+            db.executemany('INSERT INTO poison(reason) VALUES (?)', [(reason,) for reason in poison])
+        return root, fixture_manifest(root, self.engines), checkpoint
+
+    def test_migration_preserves_original_history_identity_and_is_idempotent(self):
+        root, manifest, checkpoint = self.legacy_fixture()
+        token = (root / 'identity').read_bytes()
+        inode = (root / 'lock').stat().st_ino
+        self.assertEqual(self.api.open_store(root, manifest=manifest, mode='synthetic').reason, 'schema_error')
+        migrated = self.api.migrate_legacy(root, manifest=manifest, authorization='synthetic:stage6-migration')
+        self.assertFalse(isinstance(migrated, self.api.Refusal))
+        self.assertTrue((root / 'identity').read_bytes() == token)
+        self.assertTrue(Path(str(root) + '.identity').read_bytes() == token)
+        self.assertEqual((root / 'lock').stat().st_ino, inode)
+        with sqlite3.connect(root / 'ledger.sqlite') as db:
+            state = db.execute('SELECT id,root,checkpoint FROM state').fetchone()
+            self.assertTrue(state[0].encode() == token)
+            self.assertEqual(state[1:], (str(root), checkpoint))
+            self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0], 2)
+            self.assertEqual(db.execute('SELECT registry_digest,migration_wall,migration_mono,migration_boot '
+                                        'FROM contract_meta').fetchone(),
+                             (manifest['registry_digest'], 10001.0, 8073001.0, self.boot))
+            rows = db.execute('SELECT attempt_id,dispatch_id,engine,domestic,stamp,outcome,reserved_mono,finished_mono,'
+                              'account_boot,account_mono,caller,phase,connection_attempted,http_attempted,elapsed,source '
+                              'FROM attempts ORDER BY attempt_id').fetchall()
+            self.assertEqual(rows, [
+                (7, 'legacy:7', 'chinaso news', 1, 8072913.0, 'ok', None, 8072913.0,
+                 self.boot, 8072913.0, 'legacy_probe', 'legacy', None, None, None, 'legacy'),
+                (19, 'legacy:19', 'chinaso news', 1, 8072914.25, 'ok', None, 8072914.25,
+                 self.boot, 8072914.25, 'legacy_probe', 'legacy', None, None, None, 'legacy'),
+                (41, 'legacy:41', 'quark', 1, 8072915.728828768, 'captcha', None, 8072915.728828768,
+                 self.boot, 8072915.728828768, 'legacy_probe', 'legacy', None, None, None, 'legacy'),
+            ])
+            self.assertEqual(db.execute('SELECT * FROM pauses').fetchall(), [('quark', 1, 8074715.728828768)])
+        original_db = (root / 'ledger.sqlite').read_bytes()
+        self.advance(17)
+        repeated = self.api.migrate_legacy(root, manifest=manifest, authorization='synthetic:repeat-validation')
+        self.assertFalse(isinstance(repeated, self.api.Refusal))
+        self.assertTrue((root / 'ledger.sqlite').read_bytes() == original_db, 'v2 repeat rewrote durable state')
+        calls = []
+        outcome = repeated.run_engine('bing', caller='probe', deadline_mono=self.now['mono'] + 3,
+                                      build=lambda: calls.append('build'), send=lambda context, request: None,
+                                      parse=lambda response: [])
+        self.assertEqual((outcome.outcome, calls), ('empty', ['build']))
+        refused = repeated.run_engine('quark', caller='probe', deadline_mono=self.now['mono'] + 3,
+                                      build=lambda: calls.append('quark'), send=lambda context, request: None,
+                                      parse=lambda response: [])
+        self.assertEqual((refused.reason, calls), ('cooldown', ['build']))
+
+    def test_migration_keeps_null_poison_order_and_old_clock_without_recovery(self):
+        for number, poison in enumerate([(), ('clock_error', 'legacy_reason', 'clock_error')]):
+            with self.subTest(poison=poison):
+                root, manifest, checkpoint = self.legacy_fixture(f'legacy-uncertain-{number}', unfinished=True,
+                                                                poison=poison)
+                with sqlite3.connect(root / 'ledger.sqlite') as db:
+                    db.execute('UPDATE poison SET rowid=rowid+100')
+                migrated = self.api.migrate_legacy(root, manifest=manifest, authorization='synthetic:retain-unknown')
+                self.assertFalse(isinstance(migrated, self.api.Refusal))
+                with sqlite3.connect(root / 'ledger.sqlite') as db:
+                    self.assertEqual(db.execute('SELECT checkpoint FROM state').fetchone()[0], checkpoint)
+                    self.assertEqual(db.execute('SELECT reason FROM poison ORDER BY rowid').fetchall(),
+                                     [(reason,) for reason in poison])
+                    self.assertEqual(db.execute('SELECT attempt_id,outcome,reserved_mono,finished_mono,account_boot,'
+                                                'account_mono,connection_attempted,http_attempted,elapsed '
+                                                'FROM attempts WHERE attempt_id=53').fetchone(),
+                                     (53, None, None, None, self.boot, 8072999.0, None, None, None))
+                calls = []
+                result = migrated.run_engine('bing', caller='probe', deadline_mono=self.now['mono'] + 3,
+                                             build=lambda: calls.append('build'), send=lambda context, request: None,
+                                             parse=lambda response: [])
+                self.assertEqual((result.reason, calls), ('clock_error' if poison else 'unfinished_attempt', []))
+        root, manifest, checkpoint = self.legacy_fixture('legacy-old-boot')
+        old = json.loads(checkpoint)
+        old['boot'] = 'synthetic-old-boot'
+        checkpoint = json.dumps(old)
+        with sqlite3.connect(root / 'ledger.sqlite') as db:
+            db.execute('UPDATE state SET checkpoint=?', (checkpoint,))
+        migrated = self.api.migrate_legacy(root, manifest=manifest, authorization='synthetic:no-reanchor')
+        self.assertFalse(isinstance(migrated, self.api.Refusal))
+        with sqlite3.connect(root / 'ledger.sqlite') as db:
+            self.assertEqual(db.execute('SELECT checkpoint FROM state').fetchone()[0], checkpoint)
+            self.assertEqual(db.execute('SELECT DISTINCT account_boot FROM attempts').fetchall(), [('synthetic-old-boot',)])
+        calls = []
+        result = migrated.run_engine('bing', caller='probe', deadline_mono=self.now['mono'] + 3,
+                                     build=lambda: calls.append('build'), send=lambda context, request: None,
+                                     parse=lambda response: [])
+        self.assertEqual((result.reason, calls), ('clock_error', []))
+
+    def test_migration_rejects_unknown_schema_version_and_illegal_legacy_rows(self):
+        mutations = [
+            ('CREATE TABLE extra (value TEXT)', 'schema_error'),
+            ('CREATE VIEW extra AS SELECT * FROM attempts', 'schema_error'),
+            ('CREATE TRIGGER extra AFTER INSERT ON attempts BEGIN DELETE FROM poison; END', 'schema_error'),
+            ('CREATE INDEX extra ON attempts(stamp)', 'schema_error'),
+            ('ALTER TABLE attempts ADD COLUMN extra TEXT', 'schema_error'),
+            ('DROP TABLE poison; CREATE TABLE poison (reason BLOB)', 'schema_error'),
+            ('DROP TABLE poison; CREATE TABLE poison (reason TEXT NOT NULL)', 'schema_error'),
+            ('PRAGMA user_version=1', 'schema_error'),
+            ('PRAGMA user_version=3', 'schema_error'),
+            ("UPDATE attempts SET engine='unknown_engine' WHERE rowid=7", 'schema_error'),
+            ("UPDATE attempts SET outcome='invented_success' WHERE rowid=7", 'schema_error'),
+            ('UPDATE attempts SET domestic=0 WHERE rowid=7', 'schema_error'),
+            ('UPDATE attempts SET stamp=1e999 WHERE rowid=7', 'schema_error'),
+            ('UPDATE attempts SET stamp=NULL WHERE rowid=7', 'schema_error'),
+            ('UPDATE pauses SET strikes=-1', 'schema_error'),
+            ('UPDATE pauses SET strikes=1.5', 'schema_error'),
+            ('UPDATE pauses SET until=1e999', 'schema_error'),
+            ('INSERT INTO poison VALUES (NULL)', 'schema_error'),
+            ('INSERT INTO state SELECT * FROM state', 'identity_error'),
+            ("UPDATE state SET root='/synthetic/wrong-root'", 'identity_error'),
+            ("UPDATE state SET checkpoint='{}'", 'clock_error'),
+        ]
+        for number, (sql, reason) in enumerate(mutations):
+            with self.subTest(sql=sql):
+                root, manifest, _ = self.legacy_fixture(f'legacy-refused-{number}')
+                with sqlite3.connect(root / 'ledger.sqlite') as db:
+                    db.executescript(sql)
+                before = (root / 'ledger.sqlite').read_bytes()
+                result = self.api.migrate_legacy(root, manifest=manifest, authorization='synthetic:refusal-case')
+                self.assertEqual(getattr(result, 'reason', None), reason)
+                self.assertTrue((root / 'ledger.sqlite').read_bytes() == before, 'refusal changed legacy DB')
+
+    def test_migration_authorization_manifest_modes_and_registry_digest_fail_closed(self):
+        root, manifest, _ = self.legacy_fixture('legacy-authorization')
+        before = (root / 'ledger.sqlite').read_bytes()
+        for authorization in [None, False, 1, '', ' ', 'x' * 257, 'line\nreference', '\ud800']:
+            with self.subTest(authorization_type=type(authorization).__name__):
+                result = self.api.migrate_legacy(root, manifest=manifest, authorization=authorization)
+                self.assertEqual(getattr(result, 'reason', None), 'capability_refused')
+                self.assertTrue((root / 'ledger.sqlite').read_bytes() == before)
+        for invalid in [{**manifest, 'mode': 'production'}, {**manifest, 'extra': True},
+                        {**manifest, 'mode': 'unknown'}]:
+            result = self.api.migrate_legacy(root, manifest=invalid, authorization='synthetic:invalid-manifest')
+            self.assertEqual(getattr(result, 'reason', None), 'provenance_error')
+        manifest_path = Path(self.parent.name) / 'synthetic-migration-artifact.json'
+        manifest_path.write_text(json.dumps(manifest), encoding='utf-8')
+        migrated = self.api.migrate_legacy(root, manifest=manifest_path, authorization='synthetic:path-manifest')
+        self.assertFalse(isinstance(migrated, self.api.Refusal))
+        before = (root / 'ledger.sqlite').read_bytes()
+        amended = json.loads(json.dumps(self.engines))
+        amended[0]['profile']['live_hold'] = True
+        changed = fixture_manifest(root, amended)
+        result = self.api.migrate_legacy(root, manifest=changed, authorization='synthetic:wrong-v2-digest')
+        self.assertEqual(getattr(result, 'reason', None), 'schema_error')
+        self.assertTrue((root / 'ledger.sqlite').read_bytes() == before)
+
+    def test_migration_never_initializes_missing_or_repairs_corrupt_state(self):
+        missing = Path(self.parent.name) / 'missing-legacy'
+        manifest = fixture_manifest(missing, self.engines)
+        result = self.api.migrate_legacy(missing, manifest=manifest, authorization='synthetic:missing-state')
+        self.assertEqual(getattr(result, 'reason', None), 'identity_error')
+        self.assertFalse(missing.exists())
+        self.assertFalse(Path(str(missing) + '.identity').exists())
+        root, manifest, _ = self.legacy_fixture('legacy-wrong-anchor')
+        anchor = Path(str(root) + '.identity')
+        token = (root / 'identity').read_bytes()
+        anchor.write_bytes(b'2' * 32)  # Only this test's newly created synthetic anchor.
+        before = (root / 'ledger.sqlite').read_bytes()
+        result = self.api.migrate_legacy(root, manifest=manifest, authorization='synthetic:wrong-anchor')
+        self.assertEqual(getattr(result, 'reason', None), 'identity_error')
+        self.assertTrue((root / 'ledger.sqlite').read_bytes() == before)
+        self.assertTrue((root / 'identity').read_bytes() == token)
+        self.assertTrue(anchor.read_bytes() == b'2' * 32)
+        root, manifest, _ = self.legacy_fixture('legacy-corrupt-db')
+        token = (root / 'identity').read_bytes()
+        with (root / 'ledger.sqlite').open('r+b') as file:
+            file.write(b'synthetic-not-sqlite')
+        before = (root / 'ledger.sqlite').read_bytes()
+        result = self.api.migrate_legacy(root, manifest=manifest, authorization='synthetic:corrupt-db')
+        self.assertEqual(getattr(result, 'reason', None), 'storage_error')
+        self.assertTrue((root / 'ledger.sqlite').read_bytes() == before)
+        self.assertTrue((root / 'identity').read_bytes() == token)
+        self.assertTrue(Path(str(root) + '.identity').read_bytes() == token)
+
+    def test_migration_uses_original_nonblocking_flock_across_processes(self):
+        root, manifest, _ = self.legacy_fixture('legacy-locked')
+        inode = (root / 'lock').stat().st_ino
+        before = (root / 'ledger.sqlite').read_bytes()
+        script = '''
+import fcntl
+import os
+import sys
+def deny_socket(event, args):
+    if event.startswith('socket.'):
+        raise AssertionError('maintenance child denied socket operation')
+sys.addaudithook(deny_socket)
+fd = os.open(sys.argv[1], os.O_RDWR)
+fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+print('locked', flush=True)
+os.read(0, 1)
+os.close(fd)
+'''
+        process = subprocess.Popen([sys.executable, '-S', '-c', script, str(root / 'lock')],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            import select
+            self.assertTrue(select.select([process.stdout], [], [], 5)[0], 'lock owner did not start')
+            self.assertEqual(process.stdout.readline().strip(), 'locked')
+            result = self.api.migrate_legacy(root, manifest=manifest, authorization='synthetic:busy-lock')
+            self.assertEqual(getattr(result, 'reason', None), 'lock_busy')
+            self.assertTrue((root / 'ledger.sqlite').read_bytes() == before)
+            self.assertEqual((root / 'lock').stat().st_ino, inode)
+        finally:
+            _, errors = process.communicate(input='x', timeout=5)
+            self.assertEqual(process.returncode, 0, errors)
+        result = self.api.migrate_legacy(root, manifest=manifest, authorization='synthetic:stopped-owner')
+        self.assertFalse(isinstance(result, self.api.Refusal))
+        self.assertEqual((root / 'lock').stat().st_ino, inode)
+
+    def test_migration_real_commit_crash_and_sqlite_failure_are_atomic(self):
+        # Instrument only the real SQLite driver boundary in a disposable child:
+        # before/after super().commit(), or SQLite's own authorizer refusal.
+        # No fake connection/SQL, product helper patch or simulated process death.
+        script = '''
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import time
+def deny_socket(event, args):
+    if event.startswith('socket.'):
+        raise AssertionError('maintenance child denied socket operation')
+sys.addaudithook(deny_socket)
+import wag_protection
+root = Path(sys.argv[1])
+manifest = json.loads(sys.argv[2])
+stage = sys.argv[3]
+time.time = lambda: 10001.0
+time.monotonic = lambda: 8073001.0
+class ObservedConnection(sqlite3.Connection):
+    def commit(self):
+        if stage == 'before':
+            print('before', flush=True)
+            os.read(0, 1)
+        super().commit()
+        if stage == 'after':
+            print('after', flush=True)
+            os.read(0, 1)
+original_connect = sqlite3.connect
+def connect(database, *args, **kwargs):
+    target = str(database).startswith('file:' + str(root / 'ledger.sqlite'))
+    if target:
+        kwargs['factory'] = ObservedConnection
+    db = original_connect(database, *args, **kwargs)
+    if target and stage == 'deny':
+        def authorize(action, name, *unused):
+            if action == sqlite3.SQLITE_DROP_TABLE and name == 'migration_state':
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+        db.set_authorizer(authorize)
+    return db
+sqlite3.connect = connect
+result = wag_protection.migrate_legacy(root, manifest=manifest, authorization='synthetic:atomicity-child')
+print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
+'''
+        for stage in ('before', 'after', 'deny'):
+            with self.subTest(stage=stage):
+                root, manifest, checkpoint = self.legacy_fixture(f'legacy-atomic-{stage}', unfinished=True,
+                                                                poison=('legacy_reason', 'clock_error', 'legacy_reason'))
+                token = (root / 'identity').read_bytes()
+                inode = (root / 'lock').stat().st_ino
+                process = subprocess.Popen(
+                    [sys.executable, '-S', '-c', script, str(root), json.dumps(manifest), stage],
+                    cwd=WORKSPACE, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                )
+                try:
+                    import select
+                    self.assertTrue(select.select([process.stdout], [], [], 5)[0], 'migration boundary was not reached')
+                    observed = process.stdout.readline().strip()
+                    if stage == 'deny':
+                        self.assertEqual(json.loads(observed), {'reason': 'storage_error'})
+                        _, errors = process.communicate(timeout=5)
+                        self.assertEqual(process.returncode, 0, errors)
+                    else:
+                        self.assertEqual(observed, stage)
+                        # The true transaction is still held at this boundary.
+                        self.assertEqual(self.api.open_store(root, manifest=manifest, mode='synthetic').reason, 'lock_busy')
+                        process.kill()
+                        process.wait(timeout=5)
+                    # A real reopen performs SQLite hot-journal recovery after
+                    # precommit death. It must never auto-initialize/migrate.
+                    opened = self.api.open_store(root, manifest=manifest, mode='synthetic')
+                    self.assertEqual(getattr(opened, 'reason', None), None if stage == 'after' else 'schema_error')
+                    with sqlite3.connect(root / 'ledger.sqlite') as db:
+                        self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0], 2 if stage == 'after' else 0)
+                        self.assertEqual(db.execute('SELECT checkpoint FROM state').fetchone()[0], checkpoint)
+                        self.assertEqual(db.execute('SELECT reason FROM poison ORDER BY rowid').fetchall(),
+                                         [('legacy_reason',), ('clock_error',), ('legacy_reason',)])
+                        if stage == 'after':
+                            self.assertEqual(db.execute('SELECT attempt_id,outcome FROM attempts ORDER BY attempt_id').fetchall(),
+                                             [(7, 'ok'), (19, 'ok'), (41, 'captcha'), (53, None)])
+                        else:
+                            self.assertEqual(db.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+                                             .fetchall(), [('attempts',), ('pauses',), ('poison',), ('state',)])
+                            self.assertEqual(db.execute('SELECT rowid,outcome FROM attempts ORDER BY rowid').fetchall(),
+                                             [(7, 'ok'), (19, 'ok'), (41, 'captcha'), (53, None)])
+                    self.assertTrue((root / 'identity').read_bytes() == token)
+                    self.assertTrue(Path(str(root) + '.identity').read_bytes() == token)
+                    self.assertEqual((root / 'lock').stat().st_ino, inode)
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                    process.communicate(timeout=5)
+
     def test_malformed_recovery_audit_refuses_before_callbacks(self):
         mutations = [
             ('wall', -1.0), ('mono', float('inf')), ('decision', 'reset_budget'),

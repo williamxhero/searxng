@@ -2,9 +2,9 @@
 """Durable outbound protection; importing the package has no runtime effects."""
 
 from .contract import CONTRACT, VERSION, EngineFailure, EngineOutcome, ProtectionError, Refusal, validate_settings
-from .ledger import DispatchNotification, initialize_fixture, open_store
+from .ledger import DispatchNotification, initialize_fixture, migrate_legacy, open_store
 
 __all__ = [
     'CONTRACT', 'VERSION', 'EngineFailure', 'EngineOutcome', 'ProtectionError', 'Refusal',
-    'DispatchNotification', 'initialize_fixture', 'open_store', 'validate_settings',
+    'DispatchNotification', 'initialize_fixture', 'migrate_legacy', 'open_store', 'validate_settings',
 ]

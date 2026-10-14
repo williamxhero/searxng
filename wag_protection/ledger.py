@@ -62,6 +62,14 @@ CREATE TABLE recovery_pauses (
  old_strikes INTEGER NULL, old_until REAL NULL, PRIMARY KEY(recovery_id,engine));
 PRAGMA user_version=2;
 """
+# Exact original ProbeLedger.initialize DDL, reviewed at source lines522–527.
+LEGACY_SCHEMA = """
+CREATE TABLE state (id TEXT, root TEXT, checkpoint TEXT);
+CREATE TABLE attempts (engine TEXT, domestic INTEGER, stamp REAL, outcome TEXT);
+CREATE TABLE pauses (engine TEXT PRIMARY KEY, strikes INTEGER, until REAL);
+CREATE TABLE poison (reason TEXT);
+"""
+LEGACY_TABLES = frozenset(('state', 'attempts', 'pauses', 'poison'))
 TABLES = frozenset((
     'state', 'contract_meta', 'engine_identities', 'aliases', 'attempts', 'pauses', 'poison',
     'release_checks', 'recoveries', 'recovery_attempts', 'recovery_pauses',
@@ -144,12 +152,12 @@ def _commit(db, root):
         os.close(fd)
 
 
-def _schema_signature(db):
+def _schema_signature(db, table_names=TABLES):
     objects = tuple(tuple(row) for row in db.execute(
         'SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name'
     ))
     tables = []
-    for name in sorted(TABLES):
+    for name in sorted(table_names):
         columns = tuple(tuple(row) for row in db.execute(f'PRAGMA table_xinfo("{name}")'))
         foreign_keys = tuple(tuple(row) for row in db.execute(f'PRAGMA foreign_key_list("{name}")'))
         indices = []
@@ -292,7 +300,7 @@ class Store:
         self.pid = os.getpid()
 
     @contextmanager
-    def _locked(self, *, readonly=False):
+    def _locked(self, *, readonly=False, migration=False):
         if self.pid != os.getpid():
             raise ProtectionError('capability_refused')
         for path, directory in ((self.root, True), (self.root / 'lock', False),
@@ -321,12 +329,53 @@ class Store:
             db.row_factory = sqlite3.Row
             db.execute('PRAGMA foreign_keys=ON')
             db.execute('PRAGMA synchronous=FULL')
-            self._validate(db)
+            if migration and db.execute('PRAGMA user_version').fetchone()[0] == 0:
+                db.execute('BEGIN IMMEDIATE')
+                self._validate_legacy(db)
+            else:
+                self._validate(db)
             yield db
         finally:
             if db is not None and os.getpid() == self.pid:
                 db.close()
             _close_lock(fd, self.pid)
+
+    def _validate_legacy(self, db):
+        if (db.execute('PRAGMA journal_mode').fetchone()[0] != 'delete'
+                or db.execute('PRAGMA user_version').fetchone()[0] != 0
+                or db.execute('PRAGMA quick_check').fetchone()[0] != 'ok'):
+            raise ProtectionError('schema_error')
+        reference = sqlite3.connect(':memory:')
+        try:
+            reference.executescript(LEGACY_SCHEMA)
+            if (db.execute('SELECT 1 FROM sqlite_temp_master LIMIT 1').fetchone()
+                    or _schema_signature(db, LEGACY_TABLES) != _schema_signature(reference, LEGACY_TABLES)):
+                raise ProtectionError('schema_error')
+        finally:
+            reference.close()
+        states = db.execute('SELECT * FROM state').fetchall()
+        if len(states) != 1:
+            raise ProtectionError('identity_error')
+        state = states[0]
+        identity = (self.root / 'identity').read_bytes()
+        anchor = Path(str(self.root) + '.identity').read_bytes()
+        if (not hex_value(state['id'], 32) or identity != state['id'].encode('ascii') or anchor != identity
+                or state['root'] != str(self.root)):
+            raise ProtectionError('identity_error')
+        if not _valid_clock(load_json(state['checkpoint'])):
+            raise ProtectionError('clock_error')
+        expected = {entry['engine']: entry for entry in self.manifest['registry']}
+        for row in db.execute('SELECT * FROM attempts'):
+            if (row['engine'] not in expected or type(row['domestic']) is not int
+                    or row['domestic'] != int(expected[row['engine']]['domestic']) or not finite(row['stamp'])
+                    or (row['outcome'] is not None and row['outcome'] not in OUTCOMES)):
+                raise ProtectionError('schema_error')
+        for row in db.execute('SELECT * FROM pauses'):
+            if (row['engine'] not in expected or type(row['strikes']) is not int
+                    or row['strikes'] < 0 or not finite(row['until'])):
+                raise ProtectionError('schema_error')
+        if any(not isinstance(row[0], str) for row in db.execute('SELECT reason FROM poison')):
+            raise ProtectionError('schema_error')
 
     def _validate(self, db):
         if db.execute('PRAGMA journal_mode').fetchone()[0] != 'delete':
@@ -784,6 +833,72 @@ class Dispatch:
         self.rows.append(row.lastrowid)
         self.db.execute('UPDATE state SET checkpoint=?', (canonical_json(now),))
         _commit(self.db, self.store.root)
+
+
+def migrate_legacy(root, *, manifest, authorization):
+    """Offline maintenance; the caller must stop all cooperative senders first.
+
+    Authorization is a nonsecret operation reference (1..256 UTF-8 bytes,
+    no control characters), not a live-search permit or sender-stop proof.
+    """
+    try:
+        if (not isinstance(authorization, str) or not 1 <= len(authorization.encode('utf-8')) <= 256
+                or not authorization.strip() or any(not char.isprintable() for char in authorization)):
+            return Refusal('capability_refused')
+    except UnicodeError:
+        return Refusal('capability_refused')
+    try:
+        root = canonical_path(root)
+        if not isinstance(manifest, dict):
+            path = canonical_path(manifest)
+            if not path.is_file() or path.stat().st_size > 131072:
+                raise ValueError('invalid manifest file')
+            manifest = load_json(path.read_text(encoding='utf-8'))
+        if not isinstance(manifest, dict):
+            raise ValueError('invalid manifest')
+        approved = validate_manifest(manifest, root, manifest.get('mode'))
+    except (OSError, ValueError, TypeError, KeyError, PackageNotFoundError):
+        return Refusal('provenance_error')
+    try:
+        store = Store(root, approved, approved['mode'])
+        with store._locked(migration=True) as db:
+            if db.execute('PRAGMA user_version').fetchone()[0] == VERSION:
+                return store
+            now = _clock()
+            if not _valid_clock(now):
+                raise ProtectionError('clock_error')
+            checkpoint = load_json(db.execute('SELECT checkpoint FROM state').fetchone()[0])
+            for name in sorted(LEGACY_TABLES):
+                db.execute(f'ALTER TABLE {name} RENAME TO migration_{name}')
+            # executescript would implicitly commit the renames. Execute the
+            # fixed statements individually within the original transaction.
+            for statement in SCHEMA.split(';'):
+                if statement.strip():
+                    db.execute(statement)
+            _insert_registry(db, approved['registry'])
+            db.execute('INSERT INTO state SELECT id,root,checkpoint FROM migration_state')
+            db.execute('INSERT INTO contract_meta VALUES (1,2,?,?,?,?)',
+                       (approved['registry_digest'], now['wall'], now['mono'], now['boot']))
+            db.execute('''INSERT INTO attempts SELECT
+                rowid,'legacy:' || rowid,engine,domestic,stamp,outcome,NULL,
+                CASE WHEN outcome IS NOT NULL THEN stamp ELSE NULL END,?,stamp,
+                'legacy_probe','legacy',NULL,NULL,NULL,'legacy'
+                FROM migration_attempts ORDER BY rowid''', (checkpoint['boot'],))
+            db.execute('INSERT INTO pauses SELECT engine,strikes,until FROM migration_pauses')
+            db.execute('INSERT INTO poison SELECT reason FROM migration_poison ORDER BY rowid')
+            for name in sorted(LEGACY_TABLES):
+                db.execute(f'DROP TABLE migration_{name}')
+            store._validate(db)
+            _commit(db, root)
+        return store
+    except ProtectionError as error:
+        return Refusal(error.reason)
+    except FileNotFoundError:
+        return Refusal('identity_error')
+    except (OSError, sqlite3.Error):
+        return Refusal('storage_error')
+    except (ValueError, TypeError, KeyError):
+        return Refusal('schema_error')
 
 
 def open_store(root, *, manifest, mode):
