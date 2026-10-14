@@ -126,6 +126,48 @@ class StoreTest(unittest.TestCase):
     def open(self):
         return self.api.open_store(self.root, manifest=self.manifest, mode='synthetic')
 
+    def test_malformed_recovery_audit_refuses_before_callbacks(self):
+        mutations = [
+            ('wall', -1.0), ('mono', float('inf')), ('decision', 'reset_budget'),
+            ('new_boot', ''), ('old_checkpoint', '{"mono":100}'),
+            ('old_poison_json', '{}'), ('old_poison_json', '[null]'),
+        ]
+        for number, (field, value) in enumerate(mutations):
+            with self.subTest(field=field, value=value):
+                root = Path(self.parent.name) / f'invalid-recovery-audit-{number}'
+                self.api.initialize_fixture(root, registry=self.engines, clock=lambda: dict(self.now))
+                manifest = fixture_manifest(root, self.engines)
+                store = self.api.open_store(root, manifest=manifest, mode='synthetic')
+                with sqlite3.connect(root / 'ledger.sqlite') as db:
+                    db.execute('INSERT INTO recoveries VALUES (1,?,?,?,?,?,?,?)', (
+                        'synthetic-test-authorization', canonical(self.now).decode(), '["clock_error"]',
+                        self.boot, 10000.0, 100.0, 'clock_reanchor',
+                    ))
+                    db.execute(f'UPDATE recoveries SET {field}=?', (value,))
+                calls = []
+                reopened = self.api.open_store(root, manifest=manifest, mode='synthetic')
+                outcome = store.run_engine('bing', caller='probe', deadline_mono=103.0,
+                                           build=lambda: calls.append('build'),
+                                           send=lambda context, request: calls.append('send'),
+                                           parse=lambda response: calls.append('parse') or [])
+                self.assertEqual((getattr(reopened, 'reason', None), getattr(outcome, 'reason', None), calls),
+                                 ('schema_error', 'schema_error', []))
+
+    def test_valid_recovery_audit_is_preserved_and_does_not_deny_normal_dispatch(self):
+        old_checkpoint = '{"wall":9000.0, "mono":80.0, "boot":"synthetic-old-boot"}'
+        old_poison = '["clock_error","legacy_reason","clock_error"]'
+        with sqlite3.connect(self.root / 'ledger.sqlite') as db:
+            db.execute('INSERT INTO recoveries VALUES (1,?,?,?,?,?,?,?)', (
+                'synthetic-test-authorization', old_checkpoint, old_poison,
+                self.boot, 10000.0, 100.0, 'combined',
+            ))
+        self.assertEqual(self.attempt().outcome, 'empty')
+        with sqlite3.connect(self.root / 'ledger.sqlite') as db:
+            self.assertEqual(db.execute('SELECT old_checkpoint,old_poison_json FROM recoveries').fetchall(),
+                             [(old_checkpoint, old_poison)])
+            self.assertEqual(db.execute('SELECT reason FROM poison').fetchall(), [])
+            self.assertEqual(db.execute('SELECT count(*) FROM attempts').fetchone()[0], 1)
+
     def test_unknown_attempt_column_refuses_before_callbacks(self):
         store = self.open()
         with sqlite3.connect(self.root / 'ledger.sqlite') as db:
@@ -221,6 +263,88 @@ class StoreTest(unittest.TestCase):
         self.advance(0.001)
         self.assertEqual(self.attempt().outcome, 'empty')
 
+    def test_domestic_thirty_thirtyfirst_and_exact_window_across_aliases(self):
+        root = Path(self.parent.name) / 'domestic-matrix'
+        base = next(entry for entry in self.engines if entry['engine'] == 'chinaso news')
+        engines = []
+        for number in range(6):
+            name = f'fixture-domestic-{number}'
+            engines.append({**base, 'engine': name, 'aliases': [name, f'{name}-alias']})
+        self.api.initialize_fixture(root, registry=engines, clock=lambda: dict(self.now))
+        manifest = fixture_manifest(root, engines)
+        calls = []
+        def attempt(name, caller='probe'):
+            return self.api.open_store(root, manifest=manifest, mode='synthetic').run_engine(
+                name, caller=caller, deadline_mono=self.now['mono'] + 3,
+                build=lambda: calls.append(name), send=lambda context, request: None,
+                parse=lambda response: [],
+            )
+        for number in range(5):
+            for ordinal in range(6):
+                name = f'fixture-domestic-{number}' + ('-alias' if ordinal % 2 else '')
+                self.assertEqual(attempt(name, 'probe' if ordinal % 2 else 'native_search').outcome, 'empty')
+        self.assertEqual(len(calls), 30)
+        self.assertEqual(attempt('fixture-domestic-0-alias').reason, 'engine_rate')
+        self.assertEqual(attempt('fixture-domestic-5-alias').reason, 'domestic_rate')
+        self.assertEqual(len(calls), 30)
+        self.advance(59.999)
+        self.assertEqual(attempt('fixture-domestic-5').reason, 'domestic_rate')
+        self.assertEqual(len(calls), 30)
+        self.advance(0.001)
+        self.assertEqual(attempt('fixture-domestic-5-alias').outcome, 'empty')
+        self.assertEqual(len(calls), 31)
+        with sqlite3.connect(root / 'ledger.sqlite') as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM attempts').fetchone()[0], 31)
+            self.assertEqual(db.execute('SELECT engine,stamp,account_mono FROM attempts ORDER BY attempt_id DESC LIMIT 1')
+                             .fetchone(), ('fixture-domestic-5', 160.0, 160.0))
+
+    def test_invalid_current_clock_persists_poison_before_any_callback(self):
+        invalid = [
+            ('wall', float('nan')), ('wall', float('inf')), ('wall', -1.0), ('wall', True),
+            ('mono', float('nan')), ('mono', float('inf')), ('mono', -1.0), ('mono', True),
+            ('wall', 9999.0), ('mono', 99.0), ('wall', 10002.001), ('mono', 102.001),
+        ]
+        for number, (field, value) in enumerate(invalid):
+            with self.subTest(field=field, value=value):
+                self.now.update(wall=10000.0, mono=100.0)
+                root = Path(self.parent.name) / f'invalid-clock-{number}'
+                self.api.initialize_fixture(root, registry=self.engines, clock=lambda: dict(self.now))
+                manifest = fixture_manifest(root, self.engines)
+                store = self.api.open_store(root, manifest=manifest, mode='synthetic')
+                calls = []
+                self.now[field] = value
+                result = store.run_engine('bing', caller='probe', deadline_mono=103.0,
+                                          build=lambda: calls.append('build'),
+                                          send=lambda context, request: calls.append('send'),
+                                          parse=lambda response: calls.append('parse') or [])
+                self.assertEqual(getattr(result, 'reason', None), 'clock_error')
+                self.assertEqual(calls, [])
+                self.now.update(wall=10000.0, mono=100.0)
+                with sqlite3.connect(root / 'ledger.sqlite') as db:
+                    self.assertEqual(db.execute('SELECT reason FROM poison').fetchall(), [('clock_error',)])
+                    self.assertEqual(db.execute('SELECT count(*) FROM attempts').fetchone()[0], 0)
+                snapshot = self.api.open_store(root, manifest=manifest, mode='synthetic').public_snapshot(
+                    manifest['artifact_digest'], manifest['config_digest'])
+                self.assertEqual(snapshot.reason, 'clock_error')
+
+    def test_changed_boot_poison_does_not_expire_or_refund_charge(self):
+        self.assertEqual(self.attempt().outcome, 'empty')
+        with sqlite3.connect(self.root / 'ledger.sqlite') as db:
+            previous = dict(self.now, boot='synthetic-previous-boot')
+            db.execute('UPDATE state SET checkpoint=?', (canonical(previous).decode(),))
+        calls = []
+        self.assertEqual(self.attempt('quark', build=lambda: calls.append('build')).reason, 'clock_error')
+        self.assertEqual(calls, [])
+        with sqlite3.connect(self.root / 'ledger.sqlite') as db:
+            self.assertEqual(db.execute('SELECT reason FROM poison').fetchall(), [('clock_error',)])
+            self.assertEqual(db.execute('SELECT engine,outcome,account_mono FROM attempts').fetchall(),
+                             [('bing', 'empty', 100.0)])
+            # Repairing the raw checkpoint cannot silently clear the poison.
+            db.execute('UPDATE state SET checkpoint=?', (canonical(self.now).decode(),))
+        self.advance(3600)
+        self.assertEqual(self.attempt('quark', build=lambda: calls.append('build')).reason, 'clock_error')
+        self.assertEqual(calls, [])
+
     def test_parser_failure_and_empty_keep_captcha_strikes_across_reopen(self):
         def challenged(response):
             raise self.api.EngineFailure('captcha', suspension_s=900)
@@ -246,6 +370,116 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(self.attempt('yandex').reason, 'unfinished_attempt')
         self.advance(3600)
         self.assertEqual(self.attempt('yandex').reason, 'unfinished_attempt')
+
+    def test_inherited_dispatch_refuses_without_writing_or_closing_reused_fd(self):
+        script = '''
+import json
+import os
+from pathlib import Path
+import sys
+import time
+def deny_socket(event, args):
+    if event.startswith('socket.'):
+        raise AssertionError('core child denied socket operation')
+sys.addaudithook(deny_socket)
+import wag_protection
+root = Path(sys.argv[1])
+manifest = json.loads(sys.argv[2])
+time.time = lambda: 10000.0
+time.monotonic = lambda: 100.0
+owner = os.getpid()
+store = wag_protection.open_store(root, manifest=manifest, mode='synthetic')
+reused = None
+def build():
+    global reused
+    child = os.fork()
+    if child == 0:
+        reused = os.open(os.devnull, os.O_RDONLY)
+        return
+    _, status = os.waitpid(child, 0)
+    assert status == 0
+result = store.run_engine('bing', caller='probe', deadline_mono=103.0,
+                          build=build, send=lambda context, request: None, parse=lambda response: [])
+if os.getpid() != owner:
+    os.fstat(reused)
+    fresh = wag_protection.open_store(root, manifest=manifest, mode='synthetic')
+    print(json.dumps({'child_reason': getattr(result, 'reason', None),
+                      'fresh_reason': getattr(fresh, 'reason', None), 'reused_fd_open': True}), flush=True)
+    os._exit(0)
+print(json.dumps({'parent_outcome': result.outcome}), flush=True)
+'''
+        process = subprocess.run(
+            [sys.executable, '-S', '-c', script, str(self.root), json.dumps(self.manifest)],
+            cwd=WORKSPACE, capture_output=True, text=True, timeout=5, check=False,
+        )
+        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+        records = [json.loads(line) for line in process.stdout.splitlines()]
+        self.assertEqual(records, [
+            {'child_reason': 'capability_refused', 'fresh_reason': 'lock_busy', 'reused_fd_open': True},
+            {'parent_outcome': 'empty'},
+        ])
+        with sqlite3.connect(self.root / 'ledger.sqlite') as db:
+            self.assertEqual(db.execute('SELECT engine,outcome FROM attempts').fetchall(), [('bing', 'empty')])
+            self.assertEqual(db.execute('SELECT reason FROM poison').fetchall(), [])
+
+    def test_owner_death_does_not_leave_flock_in_forked_child(self):
+        script = '''
+import json
+import os
+from pathlib import Path
+import sys
+import time
+def deny_socket(event, args):
+    if event.startswith('socket.'):
+        raise AssertionError('core child denied socket operation')
+sys.addaudithook(deny_socket)
+import wag_protection
+root = Path(sys.argv[1])
+manifest = json.loads(sys.argv[2])
+time.time = lambda: 10000.0
+time.monotonic = lambda: 100.0
+store = wag_protection.open_store(root, manifest=manifest, mode='synthetic')
+def build():
+    child = os.fork()
+    if child == 0:
+        os.read(0, 1)
+        os._exit(0)
+    print(child, flush=True)
+    os.read(0, 1)
+store.run_engine('bing', caller='probe', deadline_mono=103.0,
+                 build=build, send=lambda context, request: None, parse=lambda response: [])
+'''
+        process = subprocess.Popen(
+            [sys.executable, '-S', '-c', script, str(self.root), json.dumps(self.manifest)],
+            cwd=WORKSPACE, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        child = None
+        try:
+            import select
+            self.assertTrue(select.select([process.stdout], [], [], 5)[0], 'owner never entered build')
+            child = int(process.stdout.readline())
+            self.assertEqual(getattr(self.open(), 'reason', None), 'lock_busy')
+            process.kill()
+            process.wait(timeout=5)
+            # Child still exists and has not been told to exit. The old lock FD
+            # must already be revoked, while the parent's committed NULL survives.
+            os.kill(child, 0)
+            self.assertNotEqual(getattr(self.open(), 'reason', None), 'lock_busy')
+            calls = []
+            self.assertEqual(self.attempt('quark', build=lambda: calls.append('build')).reason,
+                             'unfinished_attempt')
+            self.assertEqual(calls, [])
+            with sqlite3.connect(self.root / 'ledger.sqlite') as db:
+                self.assertEqual(db.execute('SELECT engine,outcome FROM attempts').fetchall(), [('bing', None)])
+        finally:
+            if child is not None:
+                try:
+                    os.kill(child, 9)
+                except ProcessLookupError:
+                    pass
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=5)
 
     def test_release_receipt_unlocks_before_one_ingress_and_cannot_replay(self):
         store = self.open()

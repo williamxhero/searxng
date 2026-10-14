@@ -67,6 +67,40 @@ TABLES = frozenset((
     'release_checks', 'recoveries', 'recovery_attempts', 'recovery_pauses',
 ))
 CURRENT_DISPATCH = ContextVar('wag_protection_dispatch', default=None)
+# Only lock descriptors are tracked here, never a dispatch, DB or send permit.
+_LOCK_FDS = set()
+_LOCK_FDS_MUTEX = threading.Lock()
+_FORK_HOOK_INSTALLED = False
+
+
+def _after_fork_child():
+    try:
+        for fd in _LOCK_FDS:
+            os.close(fd)
+        _LOCK_FDS.clear()
+    finally:
+        _LOCK_FDS_MUTEX.release()
+
+
+def _open_lock(path):
+    global _FORK_HOOK_INSTALLED
+    with _LOCK_FDS_MUTEX:
+        if not _FORK_HOOK_INSTALLED:
+            os.register_at_fork(before=_LOCK_FDS_MUTEX.acquire,
+                                after_in_parent=_LOCK_FDS_MUTEX.release, after_in_child=_after_fork_child)
+            _FORK_HOOK_INSTALLED = True
+        fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+        _LOCK_FDS.add(fd)
+        return fd
+
+
+def _close_lock(fd, pid):
+    # The child hook already closed this FD. Its number may since have been
+    # reused; neither close nor SQLite cleanup may touch an inherited owner.
+    if os.getpid() == pid:
+        with _LOCK_FDS_MUTEX:
+            _LOCK_FDS.remove(fd)
+            os.close(fd)
 
 
 def _clock():
@@ -271,7 +305,7 @@ class Store:
                 _secure(path, self.manifest)
                 if suffix != '-journal':
                     raise ProtectionError('schema_error')
-        fd = os.open(self.root / 'lock', os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+        fd = _open_lock(self.root / 'lock')
         db = None
         try:
             try:
@@ -290,9 +324,9 @@ class Store:
             self._validate(db)
             yield db
         finally:
-            if db is not None:
+            if db is not None and os.getpid() == self.pid:
                 db.close()
-            os.close(fd)
+            _close_lock(fd, self.pid)
 
     def _validate(self, db):
         if db.execute('PRAGMA journal_mode').fetchone()[0] != 'delete':
@@ -351,6 +385,13 @@ class Store:
                 raise ProtectionError('schema_error')
         for row in db.execute('SELECT * FROM pauses'):
             if type(row['strikes']) is not int or row['strikes'] < 0 or not finite(row['until']):
+                raise ProtectionError('schema_error')
+        for row in db.execute('SELECT * FROM recoveries'):
+            poison = load_json(row['old_poison_json'])
+            if (not _valid_clock(load_json(row['old_checkpoint']))
+                    or not isinstance(poison, list) or any(not isinstance(reason, str) for reason in poison)
+                    or not _valid_clock({'wall': row['wall'], 'mono': row['mono'], 'boot': row['new_boot']})
+                    or row['decision'] not in ('clock_reanchor', 'terminated_sender', 'combined')):
                 raise ProtectionError('schema_error')
 
     def _admit(self, db, now, *, dispatch_id=None, engine=None, deadline=None, persist_clock=True):
@@ -434,6 +475,8 @@ class Store:
                         outcome = 'error'
                 except Exception:  # callbacks may contain private request/response data
                     pass
+                if os.getpid() != self.pid:
+                    raise ProtectionError('capability_refused')
                 finished = _clock()
                 if not _clock_matches(now, finished):
                     db.execute('INSERT INTO poison VALUES (?)', ('clock_error',))
