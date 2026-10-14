@@ -13,7 +13,7 @@ import httpcore
 import httpx
 
 from wag_protection import ProtectionError, Refusal, open_store, validate_settings
-from wag_protection.contract import json_digest, load_json
+from wag_protection.contract import json_digest, load_json, validate_manifest
 from wag_protection.ledger import CURRENT_DISPATCH, _commit
 
 
@@ -77,6 +77,39 @@ def get_store():
         return store
     except (OSError, ValueError, TypeError, KeyError):
         return Refusal('provenance_error')
+
+
+def protection_descriptor():
+    """Current config/storage diagnostics only; never call an engine or send."""
+    from searx import settings  # pylint: disable=import-outside-toplevel
+
+    descriptor = {'version': 2, 'enabled': False, 'contract': 'wag.outbound.v2'}
+    try:
+        config = validate_settings(settings['outgoing'].get('wag_protection', {'enabled': False}))
+        if not config['enabled']:
+            return descriptor
+        descriptor.update(enabled=True, artifact_digest=None, registry_digest=None,
+                          config_digest=resolved_config_digest(settings['engines'], settings['outgoing']),
+                          admission='blocked', reason='provenance_error')
+        with Path(config['artifact_manifest']).open('rb') as file:
+            raw = file.read(128 * 1024 + 1)
+        if len(raw) > 128 * 1024:
+            return descriptor
+        manifest = load_json(raw.decode('utf-8'))
+        manifest = validate_manifest(manifest, Path(config['root']), manifest['mode'])
+        descriptor.update(artifact_digest=manifest['artifact_digest'], registry_digest=manifest['registry_digest'])
+        if descriptor['config_digest'] != manifest['config_digest']:
+            return descriptor
+        # Retain the production acceptance hold; this descriptor is no permit.
+        if manifest['mode'] != 'synthetic':
+            descriptor['reason'] = 'operator_hold'
+            return descriptor
+        store = open_store(config['root'], manifest=manifest, mode=manifest['mode'], readonly=True)
+        refusal = store if isinstance(store, Refusal) else store.check_admission()
+        descriptor.update(admission='blocked' if refusal else 'available', reason=refusal.reason if refusal else None)
+    except (OSError, ValueError, TypeError, KeyError):
+        descriptor.update(enabled=True, admission='blocked', reason='provenance_error')
+    return descriptor
 
 
 def validate_engine_settings(engine_data):

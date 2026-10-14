@@ -261,6 +261,142 @@ class ProtectedTransportTest(unittest.TestCase):
                             'en-US', 0, 1, None, 3.0)
         return searx.search.Search(query), root, manifest
 
+    def test_native_finalrefs_unsupported_skip_and_native_suspension(self):
+        from flask import Flask
+        from searx.search import Search
+        from searx.search.processors import PROCESSORS
+
+        search, _, _ = self.native_search_fixture()
+        search.search_query.pageno = 100000
+        with Flask('protected-skips').test_request_context('/search'):
+            search.search()
+        snapshot = search.outbound_protection
+        self.assertEqual((snapshot['status'], snapshot['retryable']), ('complete', True))
+        self.assertEqual([ref['status'] for ref in snapshot['engines']], ['admitted', 'skipped'])
+        self.assertIsNone(snapshot['engines'][1]['reason'])
+        self.assertEqual(snapshot['engines'][1]['reservations'], 0)
+        self.assertEqual(self.tls_server.headers, 1)
+        search.search_query.pageno = 1
+        processor = PROCESSORS['quark']
+        processor.suspended_status.suspend(60, 'synthetic native suspension')
+        self.addCleanup(processor.suspended_status.resume)
+        next_search = Search(search.search_query)
+        with Flask('protected-suspended').test_request_context('/search'):
+            next_search.search()
+        snapshot = next_search.outbound_protection
+        self.assertEqual(snapshot['status'], 'partial')
+        self.assertEqual((snapshot['engines'][1]['status'], snapshot['engines'][1]['reason']), ('refused', 'cooldown'))
+        self.assertEqual(snapshot['engines'][1]['reservations'], 0)
+        self.assertEqual(self.tls_server.headers, 2)
+
+    def test_search_json_endpoint_current_config_refusal_without_send(self):
+        from searx import settings
+        from searx.network.protected import resolved_config_digest
+        import searx.webapp
+
+        _, _, manifest = self.native_search_fixture()
+        client = searx.webapp.app.test_client()
+        with patch.dict(settings['outgoing'], {'max_request_timeout': 2.5}):
+            response = client.get('/search', query_string={'q': 'offline synthetic query', 'format': 'json',
+                                                          'engines': 'bing,quark'})
+            self.assertEqual(response.status_code, 200)
+            summary = response.get_json()['outbound_protection']
+            self.assertEqual((summary['status'], summary['retryable']), ('refused', False))
+            self.assertEqual(summary['artifact_digest'], manifest['artifact_digest'])
+            self.assertEqual(summary['registry_digest'], manifest['registry_digest'])
+            self.assertEqual(summary['config_digest'], resolved_config_digest(settings['engines'], settings['outgoing']))
+            self.assertTrue(summary['engines'])
+            self.assertTrue(all(ref['reason'] == 'provenance_error' for ref in summary['engines']))
+        self.assertEqual(self.tls_server.headers, 0)
+
+    def test_native_json_finalrefs_duplicates_and_missing_processor(self):
+        import sqlite3
+        from flask import Flask
+        from searx.search.models import EngineRef
+        from searx.webutils import get_json_response
+
+        search, root, _ = self.native_search_fixture()
+        search.search_query.engineref_list = [EngineRef('bing', 'general') for _ in range(7)] + [
+            EngineRef('missing synthetic processor', 'general')]
+        with Flask('protected-finalrefs').test_request_context('/search'):
+            container = search.search()
+            summary = json.loads(get_json_response(search.search_query, container))['outbound_protection']
+        self.assertEqual((summary['status'], summary['retryable']), ('partial', False))
+        self.assertEqual(len(summary['engines']), 8)
+        self.assertEqual([ref['status'] for ref in summary['engines']], ['admitted'] * 6 + ['refused'] * 2)
+        self.assertEqual([ref['reason'] for ref in summary['engines'][-2:]], ['engine_rate', 'capability_refused'])
+        self.assertEqual(self.tls_server.headers, 6)
+        with sqlite3.connect(root / 'ledger.sqlite') as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM attempts').fetchone()[0], 6)
+
+    def test_config_endpoint_readonly_admission_and_current_digest(self):
+        import sqlite3
+        from searx import settings
+        from searx.network.protected import resolved_config_digest
+        import searx.webapp
+        import searx.search
+
+        _, root, manifest = self.native_search_fixture()
+        before = (root / 'ledger.sqlite').read_bytes()
+        with patch.object(searx.search, 'initialize', side_effect=AssertionError('config initialized engines')), \
+             patch.object(searx.search.Search, 'search', side_effect=AssertionError('config searched')):
+            response = searx.webapp.app.test_client().get('/config')
+        self.assertEqual(response.status_code, 200)
+        descriptor = response.get_json()['outbound_protection']
+        self.assertEqual(set(descriptor), {'version', 'enabled', 'contract', 'artifact_digest', 'registry_digest',
+                                           'config_digest', 'admission', 'reason'})
+        self.assertEqual((descriptor['admission'], descriptor['reason']), ('available', None))
+        for key in ('artifact_digest', 'registry_digest', 'config_digest'):
+            self.assertEqual(descriptor[key], manifest[key])
+        self.assertEqual(self.tls_server.headers, 0)
+        self.assertEqual((root / 'ledger.sqlite').read_bytes(), before)
+        with patch.dict(settings['outgoing'], {'max_request_timeout': 2.5}):
+            changed = searx.webapp.app.test_client().get('/config').get_json()['outbound_protection']
+            self.assertEqual((changed['admission'], changed['reason']), ('blocked', 'provenance_error'))
+            self.assertEqual(changed['config_digest'], resolved_config_digest(settings['engines'], settings['outgoing']))
+            self.assertNotEqual(changed['config_digest'], manifest['config_digest'])
+        with sqlite3.connect(root / 'ledger.sqlite') as db:
+            db.execute("INSERT INTO poison VALUES ('clock_error')")
+        before = (root / 'ledger.sqlite').read_bytes()
+        poisoned = searx.webapp.app.test_client().get('/config').get_json()['outbound_protection']
+        self.assertEqual((poisoned['admission'], poisoned['reason']), ('blocked', 'clock_error'))
+        self.assertEqual((root / 'ledger.sqlite').read_bytes(), before)
+        with patch.dict(settings['outgoing'], {'wag_protection': {'enabled': False}}):
+            off = searx.webapp.app.test_client().get('/config').get_json()['outbound_protection']
+            self.assertEqual(off, {'version': 2, 'enabled': False, 'contract': 'wag.outbound.v2'})
+        self.assertEqual(self.tls_server.headers, 0)
+
+    def test_native_search_json_reports_complete_machine_snapshot(self):
+        from flask import Flask
+        from searx.webutils import get_json_response
+
+        search, _, manifest = self.native_search_fixture()
+        with Flask('protected-json-test').test_request_context('/search?format=json'):
+            container = search.search()
+            payload = json.loads(get_json_response(search.search_query, container))
+        summary = payload['outbound_protection']
+        self.assertEqual(set(summary), {'version', 'enabled', 'contract', 'artifact_digest',
+                                       'registry_digest', 'config_digest', 'status', 'engines', 'retryable'})
+        self.assertEqual((summary['version'], summary['enabled'], summary['contract']),
+                         (2, True, 'wag.outbound.v2'))
+        self.assertEqual(summary['artifact_digest'], manifest['artifact_digest'])
+        self.assertEqual(summary['registry_digest'], manifest['registry_digest'])
+        self.assertEqual(summary['config_digest'], manifest['config_digest'])
+        self.assertEqual((summary['status'], summary['retryable']), ('complete', True))
+        self.assertEqual([ref['engine'] for ref in summary['engines']], ['bing', 'quark'])
+        for ref in summary['engines']:
+            self.assertEqual(set(ref), {'engine', 'category', 'status', 'reason', 'outcome', 'reservations',
+                                        'connection_attempts', 'http_attempts', 'result_count', 'elapsed_s',
+                                        'deadline_exceeded'})
+            self.assertEqual((ref['status'], ref['reason'], ref['outcome']), ('admitted', None, 'ok'))
+            self.assertEqual((ref['reservations'], ref['connection_attempts'], ref['http_attempts'],
+                              ref['result_count']), (1, 1, 1, 1))
+            self.assertIs(type(ref['deadline_exceeded']), bool)
+        self.assertEqual(len(payload['results']), 2)
+        summary['engines'][0]['status'] = 'refused'
+        self.assertEqual(json.loads(get_json_response(search.search_query, container))['outbound_protection']
+                         ['engines'][0]['status'], 'admitted')
+
     def test_native_search_two_engines_same_query_complete_nonempty(self):
         import sqlite3
         from flask import Flask
@@ -316,6 +452,8 @@ class ProtectedTransportTest(unittest.TestCase):
                 self.assertEqual(search.actual_timeout, 3.0)
                 snapshot = json.loads(json.dumps(search.outbound_protection))
                 self.assertEqual(snapshot['status'], 'unfinished')
+                self.assertIs(type(snapshot['engines'][0]['reservations']), int)
+                self.assertEqual(snapshot['engines'][0]['reservations'], 1)
                 self.assertEqual(snapshot['engines'][1]['reason'], 'deadline_exceeded')
                 self.assertEqual(self.api.open_store(root, manifest=manifest, mode='synthetic').reason, 'lock_busy')
                 with sqlite3.connect(root / 'ledger.sqlite') as db:

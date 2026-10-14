@@ -65,6 +65,10 @@ class Search:
         self._protection_cancelled = False
         self._protection_observer = None
 
+    @property
+    def outbound_protection(self):
+        return self.result_container.outbound_protection
+
     def cancel(self):
         """Notify this Search's protected worker; never touch its ledger or lock."""
         with self._protection_lock:
@@ -107,9 +111,8 @@ class Search:
                 continue
 
             # stop the request now if the engine is suspend
-            if settings['outgoing'].get('wag_protection', {}).get('enabled', False) is False:
-                if processor.extend_container_if_suspended(self.result_container):
-                    continue
+            if processor.extend_container_if_suspended(self.result_container):
+                continue
 
             # set default request parameters
             request_params = processor.get_params(self.search_query, engineref.category)
@@ -184,7 +187,7 @@ class Search:
         for engineref in sorted(self.search_query.engineref_list,
                                key=lambda ref: (aliases.get(ref.name, ref.name), ref.category)):
             ref = {
-                'engine': engineref.name, 'category': engineref.category, 'status': 'refused',
+                'engine': aliases.get(engineref.name, engineref.name), 'category': engineref.category, 'status': 'refused',
                 'reason': None, 'outcome': None, 'reservations': 0, 'connection_attempts': None,
                 'http_attempts': None, 'result_count': None, 'elapsed_s': None, 'deadline_exceeded': False,
             }
@@ -195,8 +198,14 @@ class Search:
             processor = PROCESSORS.get(engineref.name)
             params = next((params for name, _, params in requests
                            if name == engineref.name and params['category'] == engineref.category), None)
-            if processor is None or not hasattr(processor, 'search_protected') or params is None:
-                ref.update(status='skipped', reason='capability_refused')
+            if processor is None or not hasattr(processor, 'search_protected'):
+                ref['reason'] = 'capability_refused'
+                continue
+            if processor.suspended_status.is_suspended:
+                ref['reason'] = 'cooldown'
+                continue
+            if params is None:
+                ref.update(status='skipped')
                 continue
             remaining = self.start_time + self.actual_timeout - default_timer()
             if remaining <= 0:
@@ -230,7 +239,7 @@ class Search:
                 # preserves NULL and commits poison at its next safe point.
                 outcome = observer.notify()
                 if outcome is None:
-                    ref.update(status='unfinished', reason='unfinished_attempt', reservations=None,
+                    ref.update(status='unfinished', reason='unfinished_attempt', reservations=observer.reservations,
                                deadline_exceeded=True)
                     continue
             else:
@@ -238,7 +247,7 @@ class Search:
             if isinstance(outcome, Refusal):
                 ref['reason'] = outcome.reason
                 if outcome.reason == 'unfinished_attempt':
-                    ref.update(status='unfinished', reservations=None, deadline_exceeded=True)
+                    ref.update(status='unfinished', reservations=observer.reservations, deadline_exceeded=True)
                 continue
             ref.update(status='admitted', outcome=outcome.outcome, reservations=outcome.reservations,
                        connection_attempts=outcome.connection_attempts, http_attempts=outcome.http_attempts,
@@ -248,7 +257,8 @@ class Search:
                 processor.extend_container(self.result_container, self.start_time, outcome.results)
             else:
                 self.result_container.add_unresponsive_engine(engineref.name, outcome.outcome)
-        if refs and all(ref['status'] == 'admitted' and ref['outcome'] in ('ok', 'empty') for ref in refs):
+        if all((ref['status'] == 'admitted' and ref['outcome'] in ('ok', 'empty'))
+               or (ref['status'] == 'skipped' and ref['reason'] is None) for ref in refs):
             status = 'complete'
         elif any(ref['status'] == 'unfinished' for ref in refs):
             status = 'unfinished'
@@ -256,7 +266,16 @@ class Search:
             status = 'partial'
         else:
             status = 'refused'
-        self.outbound_protection = {'version': 2, 'status': status, 'retryable': False, 'engines': refs}
+        from searx.network.protected import protection_descriptor, resolved_config_digest  # pylint: disable=import-outside-toplevel
+
+        manifest = protection_descriptor() if isinstance(store, Refusal) else store.manifest
+        self.result_container.set_outbound_protection({
+            'version': 2, 'enabled': True, 'contract': 'wag.outbound.v2',
+            'artifact_digest': manifest.get('artifact_digest'),
+            'registry_digest': manifest.get('registry_digest'),
+            'config_digest': resolved_config_digest(settings['engines'], settings['outgoing']),
+            'status': status, 'retryable': status == 'complete', 'engines': refs,
+        })
 
     def search_standard(self):
         """

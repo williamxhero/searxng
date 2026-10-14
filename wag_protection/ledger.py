@@ -240,6 +240,20 @@ class DispatchNotification:
         self._cancelled = threading.Event()
         self._requested = threading.Event()
         self._result = None
+        self._reservations = 0
+
+    @property
+    def reservations(self):
+        self._check_pid()
+        with self._lock:
+            return self._reservations
+
+    def _record_reservation(self):
+        self._check_pid()
+        if self._worker != threading.get_ident():
+            raise ProtectionError('capability_refused')
+        with self._lock:
+            self._reservations += 1
 
     def _check_pid(self):
         if os.getpid() != self._pid:
@@ -473,6 +487,21 @@ class Store:
             (now['boot'], now['mono'] - 60),
         ).fetchone()[0] >= 30:
             raise ProtectionError('domestic_rate')
+
+    def check_admission(self):
+        """Read-only service admission, not an engine permit or supply proof."""
+        try:
+            with self._locked(readonly=True) as db:
+                self._admit(db, _clock(), persist_clock=False)
+            return None
+        except ProtectionError as error:
+            return Refusal(error.reason)
+        except FileNotFoundError:
+            return Refusal('identity_error')
+        except (OSError, sqlite3.Error):
+            return Refusal('storage_error')
+        except (ValueError, TypeError, KeyError):
+            return Refusal('schema_error')
 
     def run_engine(self, engine_name, *, caller, deadline_mono, build, send, parse, observer=None):
         if observer is not None:
@@ -833,6 +862,8 @@ class Dispatch:
         self.rows.append(row.lastrowid)
         self.db.execute('UPDATE state SET checkpoint=?', (canonical_json(now),))
         _commit(self.db, self.store.root)
+        if self.observer is not None:
+            self.observer._record_reservation()
 
 
 def migrate_legacy(root, *, manifest, authorization):
@@ -901,7 +932,7 @@ def migrate_legacy(root, *, manifest, authorization):
         return Refusal('schema_error')
 
 
-def open_store(root, *, manifest, mode):
+def open_store(root, *, manifest, mode, readonly=False):
     try:
         root = canonical_path(root)
         approved = validate_manifest(manifest, root, mode)
@@ -909,7 +940,7 @@ def open_store(root, *, manifest, mode):
         return Refusal('provenance_error')
     try:
         store = Store(root, approved, mode)
-        with store._locked():
+        with store._locked(readonly=readonly):
             pass
         return store
     except ProtectionError as error:
