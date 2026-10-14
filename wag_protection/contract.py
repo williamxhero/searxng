@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 import re
 import sys
-from typing import Literal, NotRequired, TypedDict, cast
+from typing import Literal, NotRequired, TypeGuard, TypedDict, cast
 
 CONTRACT = 'wag.outbound.v2'
 VERSION = 2
@@ -221,6 +221,14 @@ def canonical_path(value):
     return path
 
 
+def _settings_shape(value: dict[str, object]) -> TypeGuard[Settings]:
+    enabled = value.get('enabled')
+    return (type(enabled) is bool and not set(value) - {'enabled', 'root', 'artifact_manifest'}
+            and (not enabled or all(key in value for key in ('root', 'artifact_manifest')))
+            and all(isinstance(value[key], (str, os.PathLike))
+                    for key in ('root', 'artifact_manifest') if key in value))
+
+
 def validate_settings(value: object) -> Settings:
     """Validate raw protection values before SearXNG's bool coercion."""
     if not isinstance(value, dict) or set(value) - {'enabled', 'root', 'artifact_manifest'}:
@@ -235,7 +243,9 @@ def validate_settings(value: object) -> Settings:
             canonical_path(raw[key])
         elif enabled:
             raise ValueError('missing protection path')
-    return cast(Settings, result)
+    if not _settings_shape(result):
+        raise ValueError('invalid protection configuration')
+    return result
 
 
 def validate_evidence(value):

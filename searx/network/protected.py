@@ -88,7 +88,7 @@ def get_store():
 
     try:
         config = validate_settings(settings['outgoing'].get('wag_protection', {'enabled': False}))
-        if not config['enabled']:
+        if config['enabled'] is False:
             return Refusal('operator_hold')
         with Path(config['artifact_manifest']).open('rb') as file:
             raw = file.read(128 * 1024 + 1)
@@ -116,7 +116,7 @@ def protection_descriptor():
     descriptor = {'version': 2, 'enabled': False, 'contract': 'wag.outbound.v2'}
     try:
         config = validate_settings(settings['outgoing'].get('wag_protection', {'enabled': False}))
-        if not config['enabled']:
+        if config['enabled'] is False:
             return descriptor
         descriptor.update(
             enabled=True,
