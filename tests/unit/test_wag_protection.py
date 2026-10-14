@@ -18,6 +18,24 @@ import unittest
 WORKSPACE = Path(__file__).resolve().parents[2]
 
 
+def _reap_owned_fork(child):
+    import select
+    import signal
+
+    pidfd = os.pidfd_open(child, 0)
+    try:
+        if not select.select([pidfd], [], [], 1)[0]:
+            os.kill(child, signal.SIGKILL)
+            if not select.select([pidfd], [], [], 1)[0]:
+                raise TimeoutError('owned fork child did not exit after SIGKILL')
+        pid, status = os.waitpid(child, os.WNOHANG)
+        if pid != child:
+            raise AssertionError('owned fork child was not reaped')
+        return pid, status
+    finally:
+        os.close(pidfd)
+
+
 class ImportTest(unittest.TestCase):
     def test_import_has_no_settings_network_or_storage_side_effects(self):
         with tempfile.TemporaryDirectory(dir=os.environ['TMPDIR']) as root:
@@ -45,6 +63,30 @@ assert not list(pathlib.Path(sys.argv[1]).iterdir())
                 cwd=root, env=env, capture_output=True, text=True, check=False,
             )
             self.assertEqual(child.returncode, 0, child.stdout + child.stderr)
+
+
+class ForkCleanupTest(unittest.TestCase):
+    def test_owned_child_cleanup_reaps_normal_and_stalled_forks(self):
+        import signal
+
+        for stalled in (False, True):
+            with self.subTest(stalled=stalled):
+                read_fd, write_fd = os.pipe()
+                child = os.fork()
+                if child == 0:
+                    os.close(write_fd)
+                    if stalled:
+                        os.read(read_fd, 1)
+                    os._exit(0)
+                os.close(read_fd)
+                try:
+                    pid, status = _reap_owned_fork(child)
+                    self.assertEqual(pid, child)
+                    self.assertEqual(os.waitstatus_to_exitcode(status), -signal.SIGKILL if stalled else 0)
+                    with self.assertRaises(ChildProcessError):
+                        os.waitpid(child, os.WNOHANG)
+                finally:
+                    os.close(write_fd)
 
 
 def canonical(value):
@@ -910,7 +952,7 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
                 self.assertEqual(os.read(read_fd, 256), b'capability_refused')
             finally:
                 os.close(read_fd)
-                pid, status = os.waitpid(child, 0)
+                pid, status = _reap_owned_fork(child)
             self.assertEqual(pid, child)
             self.assertEqual(os.waitstatus_to_exitcode(status), 0)
             self.assertTrue((root / 'ledger.sqlite').read_bytes() == before)
@@ -1565,5 +1607,150 @@ store.run_engine('bing', caller='probe', deadline_mono=103.0,
                                  'provenance_error')
 
 
-if __name__ == '__main__':
+def _install_offline_test_guard():
+    import atexit
+    import ipaddress
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    original_socket = socket.socket
+    original_resolve = socket.getaddrinfo
+
+    def loopback(host):
+        try:
+            return host == 'localhost' or ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            return False
+
+    def permitted(address, family):
+        if family == socket.AF_UNIX and isinstance(address, str):
+            return Path(address).resolve().is_relative_to(Path(os.environ['TMPDIR']).resolve())
+        return isinstance(address, tuple) and loopback(address[0])
+
+    class LoopbackSocket(original_socket):
+        def connect(self, address):
+            if not permitted(address, self.family):
+                raise AssertionError('offline test denied nonloopback connect')
+            return super().connect(address)
+
+        def connect_ex(self, address):
+            if not permitted(address, self.family):
+                raise AssertionError('offline test denied nonloopback connect')
+            return super().connect_ex(address)
+
+    def resolve(host, *args, **kwargs):
+        if not loopback(host):
+            raise AssertionError('offline test denied external DNS')
+        return original_resolve(host, *args, **kwargs)
+
+    def unexpected_skip(result, test, reason):
+        raise AssertionError(f'unexpected offline test skip: {test.id()}: {reason}')
+
+    socket.socket = LoopbackSocket
+    socket.getaddrinfo = resolve
+    unittest.TestResult.addSkip = unexpected_skip
+    os.environ['SEARXNG_SETTINGS_PATH'] = str(WORKSPACE / 'tests/unit/settings/test_settings.yml')
+    os.environ['SEARXNG_DISABLE_ETC_SETTINGS'] = '1'
+
+    from searx.data.tracker_patterns import TrackerPatternsDB
+
+    class RulesHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b'{"providers":{}}'
+            self.send_response(200)
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), RulesHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    previous_urls = TrackerPatternsDB.CLEAR_LIST_URL
+    TrackerPatternsDB.CLEAR_LIST_URL = [f'http://127.0.0.1:{server.server_port}/synthetic-rules']
+
+    def close():
+        TrackerPatternsDB.CLEAR_LIST_URL = previous_urls
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=1)
+
+    atexit.register(close)
+
+
+def _offline_test_main(arguments):
+    # The namespace also blocks non-Python descendants; the socket guard gives
+    # immediate, readable refusals rather than waiting on unreachable hosts.
+    if {name for _, name in socket.if_nameindex()} != {'lo'}:
+        raise RuntimeError('offline test entry requires a loopback-only network namespace')
+    subprocess.run(['ip', 'link', 'set', 'lo', 'up'], check=True)
+    tmp = Path(os.environ['TMPDIR']).resolve()
+    if tmp != WORKSPACE / 'local/tmp':
+        raise RuntimeError('offline tests require the owning local/tmp')
+    head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=WORKSPACE, text=True).strip()
+    expected = os.environ.get('WAG_EXPECTED_HEAD')
+    if expected is not None:
+        if head != expected:
+            raise RuntimeError('offline gate checkout does not match expected HEAD')
+        subprocess.run(['git', 'diff', '--exit-code', 'HEAD'], cwd=WORKSPACE, check=True)
+    print(f'offline_head={head}', flush=True)
+
+    if arguments[0] == '--make':
+        allowed = {'test.unit', 'ci.test', 'test.pylint', 'test.rst', 'test.pybabel',
+                   'test.shell', 'test.shfmt', 'test.pyright_modified'}
+        if len(arguments) != 2 or arguments[1] not in allowed:
+            raise ValueError('unsupported offline Make target')
+        with tempfile.TemporaryDirectory(dir=tmp) as directory:
+            Path(directory, 'sitecustomize.py').symlink_to(Path(__file__).resolve())
+            env = {**os.environ, 'WAG_TEST_OFFLINE': '1',
+                   'PYTHONPATH': os.pathsep.join((directory, str(WORKSPACE))),
+                   'PY_ENV': str(Path(sys.executable).parent.parent),
+                   'PY_ENV_REQ': 'requirements.txt requirements-dev.txt'}
+            return subprocess.run(['make', 'V=1', arguments[1]], cwd=WORKSPACE, env=env, check=False).returncode
+
+    if arguments != ['--offline']:
+        raise ValueError('unsupported offline test arguments')
+    _install_offline_test_guard()
+    import importlib.metadata
+
+    paths = subprocess.check_output(['git', 'ls-files', '-z', 'wag_protection', 'searx', 'tests',
+                                     'setup.py', 'requirements*', '.github/workflows/integration.yml'], cwd=WORKSPACE)
+    source = {name: hashlib.sha256((WORKSPACE / name).read_bytes()).hexdigest()
+              for name in paths.decode().split('\0') if name and (WORKSPACE / name).is_file()}
+    dependencies = {}
+    for distribution in importlib.metadata.distributions():
+        files = {}
+        for file in distribution.files or ():
+            path = distribution.locate_file(file)
+            if path.is_file() and path.suffix != '.pyc':
+                files[str(file)] = hashlib.sha256(path.read_bytes()).hexdigest()
+        dependencies[distribution.metadata['Name']] = {'version': distribution.version, 'files_digest': digest(files)}
+    print('offline_artifact=' + canonical({'head': head, 'source': source, 'dependencies': dependencies}).decode(), flush=True)
+
+    positive = 'tests.unit.network.test_protected.ProtectedTransportTest.test_native_search_two_engines_same_query_complete_nonempty'
+
+    class OfflineResult(unittest.TextTestResult):
+        native_headers = 0
+
+        def addSuccess(self, test):
+            super().addSuccess(test)
+            if test.id() == positive:
+                self.native_headers += test.tls_server.headers
+
+    names = ['tests.unit.test_wag_protection', 'tests.unit.network.test_protected',
+             'tests.unit.network.test_network', 'tests.unit.test_search', 'tests.unit.test_results',
+             'tests.unit.test_webutils', 'tests.unit.test_webapp']
+    suite = unittest.defaultTestLoader.loadTestsFromNames(names)
+    result = unittest.TextTestRunner(verbosity=2, resultclass=OfflineResult).run(suite)
+    print(f'offline_tests={result.testsRun} native_positive_headers={result.native_headers} unexpected_skips={len(result.skipped)}', flush=True)
+    return 0 if result.wasSuccessful() and result.testsRun > 0 and result.native_headers > 0 and not result.skipped else 1
+
+
+if __name__ == 'sitecustomize' and os.environ.get('WAG_TEST_OFFLINE') == '1':
+    _install_offline_test_guard()
+elif __name__ == '__main__':
+    if sys.argv[1:2] in (['--offline'], ['--make']):
+        sys.exit(_offline_test_main(sys.argv[1:]))
     unittest.main()
