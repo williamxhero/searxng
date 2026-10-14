@@ -457,6 +457,163 @@ print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
                         process.kill()
                     process.communicate(timeout=5)
 
+    def test_recovery_requires_real_sender_stop_and_atomically_preserves_audit_charge_and_pause(self):
+        from wag_protection.ledger import _SyntheticMaintenanceSession
+
+        self.assertEqual(self.attempt().outcome, 'empty')
+        store = self.open()
+        store.claim_release('3' * 32, self.manifest['artifact_digest'], self.manifest['config_digest'], 110.0)
+        authorization = 'synthetic:stage9-physical-stop'
+        with _SyntheticMaintenanceSession(self.root, manifest=self.manifest, authorization=authorization,
+                                          decision='combined') as session:
+            sender = session.start_sender('quark')
+            old_checkpoint = canonical({'wall': 9000.0, 'mono': 80.0, 'boot': 'synthetic-old-boot'}).decode()
+            with sqlite3.connect(self.root / 'ledger.sqlite') as db:
+                db.row_factory = sqlite3.Row
+                db.execute('UPDATE state SET checkpoint=?', (old_checkpoint,))
+                db.executemany('INSERT INTO poison(rowid,reason) VALUES (?,?)', [
+                    (5, 'unfinished_attempt'), (8, 'clock_error'), (9, 'clock_error'), (11, 'legacy_reason'),
+                ])
+                db.executemany('INSERT INTO pauses VALUES (?,?,?)', [('quark', 1, 1900.0), ('yandex', 1, 800.0)])
+                old_attempts = [dict(row) for row in db.execute('SELECT * FROM attempts ORDER BY attempt_id')]
+                old_release = [tuple(row) for row in db.execute('SELECT * FROM release_checks')]
+            proof = session.seal(clear_poison=(self.api.PoisonSelection(5, 'unfinished_attempt'),
+                                              self.api.PoisonSelection(8, 'clock_error')))
+            before = (self.root / 'ledger.sqlite').read_bytes()
+            refused = self.api.recover(self.root, authorization=authorization, decision='combined', proof=proof)
+            self.assertEqual(refused.reason, 'evidence_unknown')
+            self.assertEqual((self.root / 'ledger.sqlite').read_bytes(), before)
+            session.stop_sender(sender)
+            result = self.api.recover(self.root, authorization=authorization, decision='combined', proof=proof)
+            self.assertIs(type(result), self.api.RecoveryResult)
+            self.assertEqual((result.recovery_id, result.decision, result.terminated_count, result.reanchored_count),
+                             (1, 'combined', 1, 2))
+            after = (self.root / 'ledger.sqlite').read_bytes()
+            self.assertEqual(self.api.recover(self.root, authorization=authorization,
+                                             decision='combined', proof=proof).reason, 'capability_refused')
+            self.assertEqual((self.root / 'ledger.sqlite').read_bytes(), after)
+        with sqlite3.connect(self.root / 'ledger.sqlite') as db:
+            self.assertEqual(db.execute('SELECT authorization,old_checkpoint,old_poison_json,new_boot,wall,mono,decision '
+                                        'FROM recoveries').fetchall(), [(authorization, old_checkpoint,
+                                        '["unfinished_attempt","clock_error","clock_error","legacy_reason"]',
+                                        self.boot, 10000.0, 100.0, 'combined')])
+            audited = db.execute('SELECT attempt_id,old_row_json FROM recovery_attempts ORDER BY attempt_id').fetchall()
+            self.assertEqual([json.loads(row[1]) for row in audited], old_attempts)
+            self.assertEqual(db.execute('SELECT engine,old_strikes,old_until FROM recovery_pauses ORDER BY engine').fetchall(),
+                             [('quark', 1, 1900.0), ('yandex', 1, 800.0)])
+            self.assertEqual(db.execute('SELECT engine,stamp,outcome,finished_mono,elapsed,connection_attempted,'
+                                        'http_attempted,account_boot,account_mono FROM attempts ORDER BY attempt_id').fetchall(), [
+                ('bing', 100.0, 'empty', 100.0, 0.0, 0, 0, self.boot, 100.0),
+                ('quark', 100.0, 'unknown_terminated', None, None, 0, 0, self.boot, 100.0),
+            ])
+            self.assertEqual(db.execute('SELECT * FROM pauses ORDER BY engine').fetchall(),
+                             [('quark', 2, 3700.0), ('yandex', 1, 1900.0)])
+            self.assertEqual(db.execute('SELECT rowid,reason FROM poison ORDER BY rowid').fetchall(),
+                             [(9, 'clock_error'), (11, 'legacy_reason')])
+            self.assertEqual(db.execute('SELECT * FROM release_checks').fetchall(), old_release)
+        self.assertEqual(self.attempt('quark').reason, 'clock_error')
+
+    def test_recovery_rejects_untyped_proof_production_and_seal_mutation_without_writes(self):
+        before = (self.root / 'ledger.sqlite').read_bytes()
+        for proof in (True, {}, 'proof', None):
+            with self.subTest(proof_type=type(proof).__name__):
+                result = self.api.recover(self.root, authorization='synthetic:invalid-proof',
+                                          decision='combined', proof=proof)
+                self.assertEqual(result.reason, 'capability_refused')
+                self.assertEqual((self.root / 'ledger.sqlite').read_bytes(), before)
+        result = self.api.recover(Path('/var/lib/wag-route-probe'), authorization='production:looks-valid',
+                                  decision='combined', proof={'synthetic': True})
+        self.assertEqual(result.reason, 'evidence_unknown')
+        self.assertEqual((self.root / 'ledger.sqlite').read_bytes(), before)
+
+    def test_recovery_rejects_missing_coverage_and_preserves_live_sender(self):
+        import select
+        from wag_protection.ledger import _SyntheticMaintenanceSession
+
+        authorization = 'synthetic:stage10-coverage'
+        with _SyntheticMaintenanceSession(self.root, manifest=self.manifest, authorization=authorization,
+                                          decision='combined') as session:
+            binding = session.start_sender('bing')
+            pidfd = os.pidfd_open(binding.pid, 0)
+            self.addCleanup(os.close, pidfd)
+            with self.assertRaises(TypeError):
+                self.api.MaintenanceCapability(authorization, 'combined', self.root, self.boot, 100.0, 200.0, (), session)
+            proof = session.seal(clear_poison=())
+            before = (self.root / 'ledger.sqlite').read_bytes()
+            self.assertEqual(self.api.recover(self.root, authorization=authorization,
+                                               decision='clock_reanchor', proof=proof).reason, 'capability_refused')
+            self.assertEqual(self.api.recover(self.root, authorization=authorization,
+                                               decision='combined', proof=proof).reason, 'evidence_unknown')
+            self.assertEqual((self.root / 'ledger.sqlite').read_bytes(), before)
+            self.assertEqual(select.select([pidfd], [], [], 0)[0], [])
+            session.stop_sender(binding)
+            self.assertEqual(select.select([pidfd], [], [], 0)[0], [pidfd])
+            with self.assertRaises(ChildProcessError):
+                os.waitpid(binding.pid, os.WNOHANG)
+            result = self.api.recover(self.root, authorization=authorization, decision='combined', proof=proof)
+            self.assertIs(type(result), self.api.RecoveryResult)
+            self.assertEqual(result.terminated_count, 1)
+
+        for timing in ('before_seal', 'after_seal'):
+            with self.subTest(unregistered_null=timing):
+                root = Path(self.parent.name) / f'missing-coverage-{timing}'
+                self.api.initialize_fixture(root, registry=self.engines, clock=lambda: dict(self.now))
+                manifest = fixture_manifest(root, self.engines)
+                with _SyntheticMaintenanceSession(root, manifest=manifest, authorization=authorization,
+                                                  decision='combined') as session:
+                    binding = session.start_sender('bing')
+                    pidfd = os.pidfd_open(binding.pid, 0)
+                    self.addCleanup(os.close, pidfd)
+                    if timing == 'after_seal':
+                        proof = session.seal()
+                    with sqlite3.connect(root / 'ledger.sqlite') as db:
+                        # A valid NULL row from another dispatch is not covered by this sender's birth registration.
+                        unregistered_id = db.execute(
+                            'INSERT INTO attempts (dispatch_id,engine,domestic,stamp,outcome,reserved_mono,finished_mono,'
+                            'account_boot,account_mono,caller,phase,connection_attempted,http_attempted,elapsed,source) '
+                            'SELECT ?,engine,domestic,stamp,outcome,reserved_mono,finished_mono,account_boot,account_mono,'
+                            'caller,phase,connection_attempted,http_attempted,elapsed,source FROM attempts WHERE attempt_id=?',
+                            ('stage10-unregistered-dispatch', binding.attempt_ids[0]),
+                        ).lastrowid
+                    self.assertNotIn(unregistered_id, binding.attempt_ids)
+                    before = (root / 'ledger.sqlite').read_bytes()
+                    self.assertFalse(isinstance(self.api.open_store(root, manifest=manifest, mode='synthetic'),
+                                                self.api.Refusal))
+                    for stopped in (False, True):
+                        if stopped:
+                            session.stop_sender(binding)
+                        if timing == 'before_seal':
+                            with self.assertRaises(self.api.ProtectionError) as error:
+                                session.seal()
+                            self.assertEqual(error.exception.reason, 'evidence_unknown')
+                        else:
+                            self.assertEqual(self.api.recover(root, authorization=authorization,
+                                                               decision='combined', proof=proof).reason, 'evidence_unknown')
+                        self.assertEqual((root / 'ledger.sqlite').read_bytes(), before)
+                        self.assertEqual(select.select([pidfd], [], [], 0)[0], [pidfd] if stopped else [])
+                        with sqlite3.connect(root / 'ledger.sqlite') as db:
+                            self.assertEqual(db.execute('SELECT count(*) FROM attempts WHERE outcome IS NULL').fetchone()[0], 2)
+                            for table in ('recoveries', 'recovery_attempts', 'recovery_pauses'):
+                                self.assertEqual(db.execute(f'SELECT count(*) FROM {table}').fetchone()[0], 0)
+
+    def test_recovery_audit_failure_rolls_back_without_consuming_proof(self):
+        from wag_protection.ledger import _SyntheticMaintenanceSession
+
+        authorization = 'synthetic:stage9-sql-fault'
+        with _SyntheticMaintenanceSession(self.root, manifest=self.manifest, authorization=authorization,
+                                          decision='combined') as session:
+            binding = session.start_sender('quark')
+            session.stop_sender(binding)
+            proof = session.seal()
+            before = (self.root / 'ledger.sqlite').read_bytes()
+            with patch('wag_protection.ledger._commit', side_effect=sqlite3.OperationalError('synthetic commit fault')):
+                result = self.api.recover(self.root, authorization=authorization, decision='combined', proof=proof)
+            self.assertEqual(result.reason, 'storage_error')
+            self.assertEqual((self.root / 'ledger.sqlite').read_bytes(), before)
+            # Commit uncertainty consumes the proof; retry is refused rather than guessed.
+            self.assertEqual(self.api.recover(self.root, authorization=authorization,
+                                               decision='combined', proof=proof).reason, 'capability_refused')
+
     def test_malformed_recovery_audit_refuses_before_callbacks(self):
         mutations = [
             ('wall', -1.0), ('mono', float('inf')), ('decision', 'reset_budget'),

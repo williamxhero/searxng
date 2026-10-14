@@ -261,6 +261,39 @@ class ProtectedTransportTest(unittest.TestCase):
                             'en-US', 0, 1, None, 3.0)
         return searx.search.Search(query), root, manifest
 
+    def test_missing_dependency_metadata_refuses_config_without_send(self):
+        from searx import settings
+        from tests.unit.test_wag_protection import digest
+        import searx.webapp
+
+        _, root, manifest = self.native_search_fixture()
+        manifest['distributions']['wag-spec103-nonexistent-fixture'] = '0.0.0'
+        manifest['artifact_digest'] = digest({key: manifest[key] for key in (
+            'contract', 'fork_commit', 'files', 'distributions', 'wheels', 'registry_digest', 'python_digest',
+        )})
+        Path(settings['outgoing']['wag_protection']['artifact_manifest']).write_text(json.dumps(manifest), encoding='utf-8')
+        before = (root / 'ledger.sqlite').read_bytes()
+        self.assertEqual(self.api.open_store(root, manifest=manifest, mode='synthetic').reason, 'provenance_error')
+        response = searx.webapp.app.test_client().get('/config')
+        self.assertEqual(response.status_code, 200)
+        descriptor = response.get_json()['outbound_protection']
+        self.assertEqual((descriptor['admission'], descriptor['reason']), ('blocked', 'provenance_error'))
+        self.assertEqual((root / 'ledger.sqlite').read_bytes(), before)
+        self.assertEqual(self.tls_server.headers, 0)
+
+    def test_transport_rejects_incompatible_dependency_versions_before_connect(self):
+        import httpcore
+        import httpx
+        from searx.network.protected import GuardedTransport
+
+        for module, version in ((httpcore, '1.0.8'), (httpx, '0.27.2')):
+            with self.subTest(module=module.__name__), patch.object(module, '__version__', version):
+                with self.assertRaises(self.api.ProtectionError) as error:
+                    GuardedTransport()
+                self.assertEqual(error.exception.reason, 'import_error')
+        self.assertEqual(self.server.accepts, 0)
+        self.assertEqual(self.server.headers, 0)
+
     def test_native_finalrefs_unsupported_skip_and_native_suspension(self):
         from flask import Flask
         from searx.search import Search
@@ -272,9 +305,9 @@ class ProtectedTransportTest(unittest.TestCase):
             search.search()
         snapshot = search.outbound_protection
         self.assertEqual((snapshot['status'], snapshot['retryable']), ('complete', True))
-        self.assertEqual([ref['status'] for ref in snapshot['engines']], ['admitted', 'skipped'])
-        self.assertIsNone(snapshot['engines'][1]['reason'])
-        self.assertEqual(snapshot['engines'][1]['reservations'], 0)
+        self.assertEqual([ref['status'] for ref in snapshot['engines']], ['skipped', 'admitted'])
+        self.assertIsNone(snapshot['engines'][0]['reason'])
+        self.assertEqual(snapshot['engines'][0]['reservations'], 0)
         self.assertEqual(self.tls_server.headers, 1)
         search.search_query.pageno = 1
         processor = PROCESSORS['quark']

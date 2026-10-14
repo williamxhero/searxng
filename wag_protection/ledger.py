@@ -10,7 +10,12 @@ from importlib.metadata import PackageNotFoundError
 import os
 from pathlib import Path
 import secrets
+import select
+import signal
 import sqlite3
+import subprocess
+import sys
+from types import MappingProxyType
 import stat
 import tempfile
 import threading
@@ -21,6 +26,8 @@ from .contract import (
     CALLERS, OUTCOMES, PHASES, REASONS, PRODUCTION_ROOT, VERSION,
     EngineFailure, EngineOutcome, ProtectionError, Refusal, canonical_json, canonical_path, finite,
     hex_value, json_digest, load_json, validate_evidence, validate_manifest, validate_registry,
+    MaintenanceCapability, PoisonSelection, RecoveryProofV1, RecoveryResult, SenderBinding,
+    RECOVERY_DECISIONS, recovery_authorization, _MAINTENANCE_TOKEN,
 )
 
 SCHEMA = """
@@ -864,6 +871,335 @@ class Dispatch:
         _commit(self.db, self.store.root)
         if self.observer is not None:
             self.observer._record_reservation()
+
+
+def _freeze_manifest(value):
+    if type(value) is dict:
+        return MappingProxyType({key: _freeze_manifest(item) for key, item in value.items()})
+    if type(value) is list:
+        return tuple(_freeze_manifest(item) for item in value)
+    return value
+
+
+def _recovery_files(store):
+    paths = ((store.root, True), (store.root / 'lock', False), (store.root / 'identity', False),
+             (Path(str(store.root) + '.identity'), False), (store.root / 'ledger.sqlite', False))
+    return tuple((info.st_dev, info.st_ino) for path, directory in paths
+                 for info in (_secure(path, store.manifest, directory),))
+
+
+def _recovery_snapshot(db):
+    return canonical_json({name: [tuple(row) for row in db.execute(f'SELECT rowid,* FROM {name} ORDER BY rowid')]
+                           for name in sorted(TABLES)})
+
+
+# Fixed, cooperative fixture sender: no caller code, network, descendants or
+# work transfer. The startup pipe is released only after parent birth/pidfd registration.
+_SYNTHETIC_SENDER = '''
+import json
+import os
+import sys
+import time
+def denied(event, args):
+    if event.startswith('socket.') or event in ('os.fork', 'os.forkpty', 'subprocess.Popen'):
+        raise RuntimeError('synthetic sender forbids network and descendants')
+sys.addaudithook(denied)
+value = json.loads(sys.stdin.readline())
+sys.path.insert(0, value['manifest']['module_root'])
+import wag_protection
+from wag_protection.ledger import CURRENT_DISPATCH
+time.time = lambda: value['clock']['wall']
+time.monotonic = lambda: value['clock']['mono']
+registered = {'attempt_ids': [], 'dispatch_id': None}
+if value['engine'] is not None:
+    store = wag_protection.open_store(value['root'], manifest=value['manifest'], mode='synthetic')
+    if isinstance(store, wag_protection.Refusal):
+        sys.exit(2)
+    def interrupted_build():
+        context = CURRENT_DISPATCH.get()
+        registered.update(attempt_ids=context.rows, dispatch_id=context.dispatch_id)
+        raise SystemExit(0)
+    try:
+        store.run_engine(value['engine'], caller='probe', deadline_mono=value['clock']['mono'] + 3,
+                         build=interrupted_build, send=None, parse=None)
+    except SystemExit:
+        pass
+print(json.dumps(registered), flush=True)
+os.read(0, 1)
+os._exit(0)
+'''
+
+
+class _SyntheticMaintenanceSession:
+    """Private disposable fixture owner, not a production sender-set witness."""
+
+    def __init__(self, root, *, manifest, authorization, decision):
+        if (not recovery_authorization(authorization) or type(decision) is not str
+                or decision not in RECOVERY_DECISIONS):
+            raise ProtectionError('capability_refused')
+        root = canonical_path(root)
+        temporary_root = canonical_path(tempfile.gettempdir())
+        if root == temporary_root or temporary_root not in root.parents:
+            raise ProtectionError('evidence_unknown')
+        approved = validate_manifest(manifest, root, 'synthetic')
+        self._manifest_json = canonical_json(approved)
+        self._manifest = _freeze_manifest(approved)
+        self._store = Store(root, approved, 'synthetic')
+        self._pid = os.getpid()
+        self._thread = threading.get_ident()
+        self._authorization = authorization
+        self._decision = decision
+        self._issued = _clock()
+        if not _valid_clock(self._issued) or len(self._issued['boot'].encode('utf-8')) > 128:
+            raise ProtectionError('clock_error')
+        self._records = []
+        self._proof = None
+        self._capability = None
+        self._used = False
+        self._closed = False
+        with self._store._locked(readonly=True) as db:
+            self._files = _recovery_files(self._store)
+            self._identity = db.execute('SELECT id FROM state').fetchone()[0]
+
+    def _check_owner(self):
+        if (type(self) is not _SyntheticMaintenanceSession or self._pid != os.getpid()
+                or self._thread != threading.get_ident() or self._closed):
+            raise ProtectionError('capability_refused')
+
+    def __enter__(self):
+        self._check_owner()
+        return self
+
+    def __exit__(self, *unused):
+        self.close()
+
+    def start_sender(self, engine=None):
+        self._check_owner()
+        if self._proof is not None or len(self._records) >= 64:
+            raise ProtectionError('capability_refused')
+        if engine is not None and (type(engine) is not str or engine not in {
+                entry['engine'] for entry in self._store.manifest['registry']}):
+            raise ProtectionError('capability_refused')
+        if not hasattr(os, 'pidfd_open') or not hasattr(signal, 'pidfd_send_signal'):
+            raise ProtectionError('evidence_unknown')
+        with self._store._locked(readonly=True) as db:
+            previous = [dict(row) for row in db.execute('SELECT * FROM attempts ORDER BY attempt_id')]
+        process = subprocess.Popen([sys.executable, '-I', '-S', '-c', _SYNTHETIC_SENDER],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, close_fds=True)
+        record = {'process': process, 'pidfd': None, 'binding': None, 'reaped': False}
+        self._records.append(record)
+        try:
+            record['pidfd'] = os.pidfd_open(process.pid, 0)
+            birth = Path(f'/proc/{process.pid}/stat').read_text(encoding='ascii').rsplit(')', 1)[1].split()
+            if int(birth[1]) != self._pid:
+                raise ProtectionError('evidence_unknown')
+            start_ticks = int(birth[19])
+            process.stdin.write(canonical_json({'root': str(self._store.root), 'manifest': load_json(self._manifest_json),
+                                               'engine': engine, 'clock': _clock()}) + '\n')
+            process.stdin.flush()
+            if not select.select([process.stdout], [], [], 5)[0]:
+                raise ProtectionError('evidence_unknown')
+            message = load_json(process.stdout.readline())
+            with self._store._locked(readonly=True) as db:
+                rows = [dict(row) for row in db.execute('SELECT * FROM attempts ORDER BY attempt_id')]
+            if rows[:len(previous)] != previous:
+                raise ProtectionError('evidence_unknown')
+            added = rows[len(previous):]
+            if engine is None:
+                valid = not added and message == {'attempt_ids': [], 'dispatch_id': None}
+            else:
+                valid = (len(added) == 1 and added[0]['engine'] == engine and added[0]['source'] == 'v2'
+                         and added[0]['caller'] == 'probe' and added[0]['outcome'] is None
+                         and added[0]['dispatch_id'] == message.get('dispatch_id')
+                         and message.get('attempt_ids') == [added[0]['attempt_id']])
+            if not valid:
+                raise ProtectionError('evidence_unknown')
+            binding = SenderBinding(process.pid, start_ticks, self._issued['boot'],
+                                    tuple(row['attempt_id'] for row in added), _MAINTENANCE_TOKEN)
+            record['binding'] = binding
+            return binding
+        except (OSError, ValueError, TypeError, KeyError):
+            raise ProtectionError('evidence_unknown') from None
+
+    def stop_sender(self, binding):
+        self._check_owner()
+        record = next((item for item in self._records if item['binding'] is binding), None)
+        if type(binding) is not SenderBinding or record is None or record['reaped']:
+            raise ProtectionError('capability_refused')
+        process = record['process']
+        process.stdin.write('x')
+        process.stdin.flush()
+        if not select.select([record['pidfd']], [], [], 5)[0]:
+            raise ProtectionError('evidence_unknown')
+        pid, status = os.waitpid(binding.pid, 0)
+        if pid != binding.pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+            raise ProtectionError('evidence_unknown')
+        record['reaped'] = True
+        process.returncode = os.waitstatus_to_exitcode(status)
+
+    def seal(self, *, clear_poison=()):
+        self._check_owner()
+        if self._proof is not None or not self._records or any(item['binding'] is None for item in self._records):
+            raise ProtectionError('evidence_unknown')
+        if (type(clear_poison) is not tuple or len(clear_poison) > 64
+                or any(type(item) is not PoisonSelection for item in clear_poison)
+                or len({item.rowid for item in clear_poison}) != len(clear_poison)):
+            raise ProtectionError('capability_refused')
+        bindings = tuple(item['binding'] for item in self._records)
+        ids = tuple(attempt_id for binding in bindings for attempt_id in binding.attempt_ids)
+        with self._store._locked(readonly=True) as db:
+            unknown = tuple(row[0] for row in db.execute('SELECT attempt_id FROM attempts WHERE outcome IS NULL ORDER BY attempt_id'))
+            if len(ids) > 64 or len(ids) != len(set(ids)) or tuple(sorted(ids)) != unknown:
+                raise ProtectionError('evidence_unknown')
+            if self._files != _recovery_files(self._store):
+                raise ProtectionError('identity_error')
+            self._snapshot = _recovery_snapshot(db)
+        capability = MaintenanceCapability(self._authorization, self._decision, self._store.root,
+                                           self._issued['boot'], self._issued['mono'], self._issued['mono'] + 300,
+                                           clear_poison, _MAINTENANCE_TOKEN)
+        self._capability = capability
+        self._proof = RecoveryProofV1(1, capability, self._manifest, bindings, self)
+        return self._proof
+
+    def close(self):
+        self._check_owner()
+        for record in self._records:
+            process, fd = record['process'], record['pidfd']
+            if not record['reaped']:
+                if fd is not None:
+                    if not select.select([fd], [], [], 0)[0]:
+                        signal.pidfd_send_signal(fd, signal.SIGKILL)
+                    _, status = os.waitpid(process.pid, 0)
+                    process.returncode = os.waitstatus_to_exitcode(status)
+                else:
+                    process.kill()
+                    process.wait(timeout=5)
+            for pipe in (process.stdin, process.stdout, process.stderr):
+                pipe.close()
+            if fd is not None:
+                os.close(fd)
+        self._closed = True
+
+
+def _recovery_witness(root, authorization, decision, proof):
+    if type(proof) is not RecoveryProofV1 or type(proof._witness) is not _SyntheticMaintenanceSession:
+        raise ProtectionError('capability_refused')
+    session = proof._witness
+    _SyntheticMaintenanceSession._check_owner(session)
+    capability = proof.capability
+    if (session._proof is not proof or type(capability) is not MaintenanceCapability
+            or session._capability is not capability or session._used or capability._issuance is not _MAINTENANCE_TOKEN
+            or type(proof.version) is not int or proof.version != 1
+            or authorization != capability.authorization or decision != capability.decision):
+        raise ProtectionError('capability_refused')
+    if root != capability.root:
+        raise ProtectionError('identity_error')
+    if proof.approved_manifest is not session._manifest:
+        raise ProtectionError('provenance_error')
+    now = _clock()
+    if (not _valid_clock(now) or now['boot'] != capability.boot
+            or not capability.issued_mono <= now['mono'] < capability.deadline_mono):
+        raise ProtectionError('evidence_unknown')
+    if (type(proof.sender_bindings) is not tuple or not 1 <= len(proof.sender_bindings) <= 64
+            or len(proof.sender_bindings) != len(session._records)):
+        raise ProtectionError('evidence_unknown')
+    for binding, record in zip(proof.sender_bindings, session._records):
+        if (type(binding) is not SenderBinding or record['binding'] is not binding or binding._issuance is not _MAINTENANCE_TOKEN
+                or binding.boot != now['boot'] or not record['reaped'] or record['pidfd'] is None
+                or not select.select([record['pidfd']], [], [], 0)[0]):
+            raise ProtectionError('evidence_unknown')
+    approved = validate_manifest(load_json(session._manifest_json), root, 'synthetic')
+    store = Store(root, approved, 'synthetic')
+    if _recovery_files(store) != session._files:
+        raise ProtectionError('identity_error')
+    return session, store, now
+
+
+def recover(root, *, authorization, decision, proof):
+    """Audited synthetic-only maintenance. Never returns a sending permit."""
+    if (not recovery_authorization(authorization) or type(decision) is not str
+            or decision not in RECOVERY_DECISIONS):
+        return Refusal('capability_refused')
+    try:
+        root = canonical_path(root)
+        # No production sender-set witness is approved. Do not open live state.
+        if root == PRODUCTION_ROOT or PRODUCTION_ROOT in root.parents:
+            return Refusal('evidence_unknown')
+        session, store, now = _recovery_witness(root, authorization, decision, proof)
+        with store._locked() as db:
+            db.execute('BEGIN IMMEDIATE')
+            session, _, now = _recovery_witness(root, authorization, decision, proof)
+            if (db.execute('SELECT id FROM state').fetchone()[0] != session._identity
+                    or _recovery_snapshot(db) != session._snapshot):
+                raise ProtectionError('evidence_unknown')
+            if db.execute('SELECT 1 FROM recoveries WHERE authorization=?', (authorization,)).fetchone():
+                raise ProtectionError('capability_refused')
+            old_checkpoint = db.execute('SELECT checkpoint FROM state').fetchone()[0]
+            checkpoint = load_json(old_checkpoint)
+            attempts = [dict(row) for row in db.execute('SELECT * FROM attempts ORDER BY attempt_id')]
+            unfinished = [row for row in attempts if row['outcome'] is None]
+            ids = sorted(attempt_id for binding in proof.sender_bindings for attempt_id in binding.attempt_ids)
+            if ids != [row['attempt_id'] for row in unfinished]:
+                raise ProtectionError('evidence_unknown')
+            if decision == 'clock_reanchor' and unfinished:
+                raise ProtectionError('evidence_unknown')
+            if decision == 'terminated_sender' and not _clock_matches(checkpoint, now):
+                raise ProtectionError('clock_error')
+            reanchor = decision in ('clock_reanchor', 'combined')
+            changed = attempts if reanchor else unfinished
+            poison = [tuple(row) for row in db.execute('SELECT rowid,reason FROM poison ORDER BY rowid')]
+            for selection in proof.capability.clear_poison:
+                if ((selection.rowid, selection.reason) not in poison
+                        or (selection.reason == 'clock_error' and not reanchor)
+                        or (selection.reason == 'unfinished_attempt' and not unfinished)):
+                    raise ProtectionError('evidence_unknown')
+            old_pauses = {row['engine']: (row['strikes'], row['until']) for row in db.execute('SELECT * FROM pauses')}
+            affected = {row['engine'] for row in unfinished}
+            pause_plan = {}
+            for engine in sorted(set(old_pauses) | affected if reanchor else affected):
+                strikes, until = old_pauses.get(engine, (0, checkpoint['mono']))
+                strikes += int(engine in affected)
+                remaining = max(until - checkpoint['mono'], 1800 * 2 ** min(max(strikes - 1, 0), 16), 0)
+                new_until = now['mono'] + remaining
+                if not finite(new_until):
+                    raise ProtectionError('clock_error')
+                pause_plan[engine] = (strikes, new_until)
+            audit_rows = [(row['attempt_id'], canonical_json(row)) for row in changed]
+            if any(len(text.encode('utf-8')) > 8192 for _, text in audit_rows):
+                raise ProtectionError('schema_error')
+            # Consume before the first write: commit uncertainty must not permit
+            # replay, even when SQLite committed but the following fsync failed.
+            session._used = True
+            recovery_id = db.execute('INSERT INTO recoveries '
+                '(authorization,old_checkpoint,old_poison_json,new_boot,wall,mono,decision) VALUES (?,?,?,?,?,?,?)',
+                (authorization, old_checkpoint, canonical_json([reason for _, reason in poison]),
+                 now['boot'], now['wall'], now['mono'], decision)).lastrowid
+            db.executemany('INSERT INTO recovery_attempts VALUES (?,?,?)',
+                           [(recovery_id, attempt_id, text) for attempt_id, text in audit_rows])
+            db.executemany('INSERT INTO recovery_pauses VALUES (?,?,?,?)',
+                           [(recovery_id, engine, *old_pauses.get(engine, (None, None))) for engine in pause_plan])
+            for row in changed:
+                if reanchor or row['outcome'] is None:
+                    db.execute('UPDATE attempts SET account_boot=?,account_mono=? WHERE attempt_id=?',
+                               (now['boot'], now['mono'], row['attempt_id']))
+                if row['outcome'] is None:
+                    db.execute('UPDATE attempts SET outcome=? WHERE attempt_id=?', ('unknown_terminated', row['attempt_id']))
+            for engine, (strikes, until) in pause_plan.items():
+                db.execute('INSERT OR REPLACE INTO pauses VALUES (?,?,?)', (engine, strikes, until))
+            db.execute('UPDATE state SET checkpoint=?', (canonical_json(now),))
+            for selection in proof.capability.clear_poison:
+                db.execute('DELETE FROM poison WHERE rowid=? AND reason=?', (selection.rowid, selection.reason))
+            _commit(db, root)
+            return RecoveryResult(recovery_id, decision, len(unfinished), len(attempts) if reanchor else 0)
+    except ProtectionError as error:
+        return Refusal(error.reason)
+    except FileNotFoundError:
+        return Refusal('identity_error')
+    except (OSError, sqlite3.Error):
+        return Refusal('storage_error')
+    except (ValueError, TypeError, KeyError, PackageNotFoundError):
+        return Refusal('provenance_error')
 
 
 def migrate_legacy(root, *, manifest, authorization):

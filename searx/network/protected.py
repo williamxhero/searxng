@@ -4,6 +4,7 @@
 import asyncio
 from contextlib import contextmanager
 import ipaddress
+from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 import select
 import socket
@@ -107,7 +108,7 @@ def protection_descriptor():
         store = open_store(config['root'], manifest=manifest, mode=manifest['mode'], readonly=True)
         refusal = store if isinstance(store, Refusal) else store.check_admission()
         descriptor.update(admission='blocked' if refusal else 'available', reason=refusal.reason if refusal else None)
-    except (OSError, ValueError, TypeError, KeyError):
+    except (OSError, ValueError, TypeError, KeyError, PackageNotFoundError):
         descriptor.update(enabled=True, admission='blocked', reason='provenance_error')
     return descriptor
 

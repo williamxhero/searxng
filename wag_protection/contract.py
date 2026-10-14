@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """The canonical outbound-protection wire and storage contract."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import importlib.metadata
 import json
@@ -62,6 +62,86 @@ class EngineOutcome:
     elapsed_s: float | None
     deadline_exceeded: bool
     results: object = None
+
+
+RECOVERY_DECISIONS = frozenset(('clock_reanchor', 'terminated_sender', 'combined'))
+_MAINTENANCE_TOKEN = object()
+
+
+def recovery_authorization(value):
+    try:
+        return (type(value) is str and 1 <= len(value.encode('utf-8')) <= 256
+                and bool(value.strip()) and all(char.isprintable() for char in value))
+    except UnicodeError:
+        return False
+
+
+class _EphemeralMaintenance:
+    __slots__ = ()
+
+    def __reduce_ex__(self, protocol):
+        raise TypeError('maintenance witnesses cannot be serialized')
+
+
+@dataclass(frozen=True, slots=True)
+class PoisonSelection:
+    rowid: int
+    reason: str
+
+    def __post_init__(self):
+        if (type(self.rowid) is not int or self.rowid <= 0 or type(self.reason) is not str
+                or self.reason not in ('clock_error', 'unfinished_attempt')):
+            raise ValueError('invalid poison selection')
+
+
+@dataclass(frozen=True, slots=True)
+class MaintenanceCapability(_EphemeralMaintenance):
+    authorization: str
+    decision: str
+    root: Path
+    boot: str
+    issued_mono: float
+    deadline_mono: float
+    clear_poison: tuple[PoisonSelection, ...]
+    _issuance: object = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self):
+        if self._issuance is not _MAINTENANCE_TOKEN:
+            raise TypeError('private maintenance issuance')
+
+
+@dataclass(frozen=True, slots=True)
+class SenderBinding(_EphemeralMaintenance):
+    pid: int
+    start_ticks: int
+    boot: str
+    attempt_ids: tuple[int, ...]
+    _issuance: object = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self):
+        if self._issuance is not _MAINTENANCE_TOKEN:
+            raise TypeError('private sender issuance')
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryProofV1(_EphemeralMaintenance):
+    version: int
+    capability: MaintenanceCapability
+    approved_manifest: object = field(repr=False)
+    sender_bindings: tuple[SenderBinding, ...]
+    _witness: object = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self):
+        if self._witness is None:
+            raise TypeError('private recovery issuance')
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryResult:
+    recovery_id: int
+    decision: str
+    terminated_count: int
+    reanchored_count: int
 
 
 class ProtectionError(Exception):
