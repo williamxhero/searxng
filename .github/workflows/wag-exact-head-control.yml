@@ -1,0 +1,548 @@
+---
+# AI-authored: Hermes/coder (gpt-6.1-sol). Downstream-only SPEC issue #1
+# comment 6181937409; Hermes/default is sole integrator. Not a PR required check.
+name: WAG exact-head control
+
+on:
+  push:
+    branches: [ci/spec103-a-2829e93-control-v1]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wag-exact-head-2829e93-control-v1
+  cancel-in-progress: false
+
+env:
+  WAG_EXPECTED_HEAD: 2829e93b89d15081aec1694ca46c6e8667ff5b8e
+  WAG_BASE: 9fea41204fdfa7a5cfa15b0ebd12904c520478ce
+  WAG_CONTROL_SHA: ${{ github.sha }}
+  WAG_CONTROL_PATH: .github/workflows/wag-exact-head-control.yml
+  WAG_REPOSITORY: ${{ github.repository }}
+  WAG_EVENT: ${{ github.event_name }}
+  WAG_REF: ${{ github.ref }}
+  WAG_RUN_ID: ${{ github.run_id }}
+  WAG_RUN_ATTEMPT: ${{ github.run_attempt }}
+  WAG_JOB: ${{ github.job }}
+
+  TMPDIR: ${{ github.workspace }}/local/tmp
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    env:
+      WAG_KIND: test
+      WAG_PYTHON: ${{ matrix.python-version }}
+      WAG_LABEL: ubuntu-26.04
+    steps:
+      - name: Checkout fixed candidate, never event SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with: &candidate_checkout
+          repository: williamxhero/searxng
+          ref: 2829e93b89d15081aec1694ca46c6e8667ff5b8e
+          persist-credentials: "false"
+          fetch-depth: 1
+
+      - name: Initialize evidence and verify identities before setup/install
+        id: identity
+        shell: bash
+        run: &initialize |
+          set -euo pipefail
+          # All helper code and authoritative evidence stay outside candidate.
+          tee "$RUNNER_TEMP/wag-control.py" >/dev/null <<'PY'
+          import datetime
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import shutil
+          import stat
+          import subprocess
+          import sys
+          import threading
+          import zipfile
+
+          ROOT = Path(os.environ['GITHUB_WORKSPACE'])
+          EVIDENCE = Path(os.environ['RUNNER_TEMP']) / 'wag-evidence'
+          STATE = EVIDENCE / 'commands.json'
+          CANDIDATE = os.environ['WAG_EXPECTED_HEAD']
+          KIND = os.environ['WAG_KIND']
+          ANCHORS = {
+              '.github/workflows/integration.yml': '4b3d17b7b3330fc1c989c15a35bd20923eb4c040e07aae549b653331831d4ffc',
+              'requirements-protection.lock': 'b8becf59015b5e464f75cad0aa86da9a8c20dae07b3e91ec04b0914932bc9541',
+              'client/simple/package-lock.json': 'c9a8e73d6b1e579ba7cea36264638a1ffedcecf3c16502c97ae2a2c1552267d1',
+              'Makefile': 'e79b6d94f6dee7ec121319d6288cd2b140802ce227674cc105813ae3a5ab1971',
+              'tests/unit/test_wag_protection.py': 'c0caf08eeb2df984bf065a801cda8236d3dde4fcfb9b83e05ff199eaac06bc57',
+          }
+          COMMANDS = {
+              'install': 'make V=1 install',
+              'venv': 'python -m venv local/protection-venv',
+              'locked_install': 'local/protection-venv/bin/python -m pip install --require-hashes -r requirements-protection.lock',
+              'tests': '''mkdir -p "$TMPDIR"
+          unshare --user --map-user=0 --map-group=1000 --net -- \\
+            local/py3/bin/python -m tests.unit.test_wag_protection --make ci.test''',
+              'offline': '''mkdir -p "$TMPDIR"
+          set -o pipefail
+          set +e
+          unshare --user --map-user=0 --map-group=1000 --net -- \\
+            local/protection-venv/bin/python -m tests.unit.test_wag_protection --offline \\
+            2>&1 | tee local/protection-offline.log
+          codes=("${PIPESTATUS[@]}")
+          printf '%s\\n' "${codes[@]}" > "$RUNNER_TEMP/wag-pipeline-exits.txt"
+          test "${codes[0]}" -eq 0 && test "${codes[1]}" -eq 0''',
+              'lint': 'make themes.lint',
+              'build': 'make themes.all',
+              'type_version': 'local/py3/bin/basedpyright --version',
+              'type_help': 'local/py3/bin/basedpyright --help',
+              'type': 'local/py3/bin/basedpyright --outputjson',
+          }
+
+          def now():
+              return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+          def sha(data):
+              return hashlib.sha256(data).hexdigest()
+
+          def save(name, value):
+              data = (json.dumps(value, sort_keys=True, ensure_ascii=True, separators=(',', ':')) + '\n').encode()
+              (EVIDENCE / name).write_bytes(data)
+              return sha(data)
+
+          def git(*args):
+              return subprocess.check_output(['git', *args], cwd=ROOT)
+
+          def planned():
+              if KIND == 'protection':
+                  return ['venv', 'locked_install', 'offline']
+              if KIND == 'theme':
+                  return ['install', 'lint', 'build']
+              return ['install', 'tests'] + (['type_version', 'type_help', 'type'] if os.environ['WAG_PYTHON'] == '3.12' else [])
+
+          def snapshot(phase):
+              # Expected bytes come from immutable candidate Git blobs, NOT disk.
+              tree = git('ls-tree', '-rz', '--full-tree', CANDIDATE)
+              entries = []
+              for item in tree.split(b'\0'):
+                  if not item:
+                      continue
+                  meta, rawpath = item.split(b'\t', 1)
+                  mode, kind, oid = meta.decode().split()
+                  path = rawpath.decode('utf-8', errors='strict')
+                  if kind != 'blob' or mode not in ('100644', '100755', '120000'):
+                      raise RuntimeError('unsupported tracked object: ' + path)
+                  if Path(path).is_absolute() or '..' in Path(path).parts:
+                      raise RuntimeError('unsafe tracked path: ' + path)
+                  entries.append((path, mode, oid))
+              trusted, observed, mismatches = [], [], []
+              batch = subprocess.Popen(['git', 'cat-file', '--batch'], cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+              try:
+                  for path, mode, oid in sorted(entries):
+                      batch.stdin.write((oid + '\n').encode())
+                      batch.stdin.flush()
+                      header = batch.stdout.readline().decode().split()
+                      if len(header) != 3 or header[:2] != [oid, 'blob']:
+                          raise RuntimeError('invalid blob response')
+                      data = batch.stdout.read(int(header[2]))
+                      if len(data) != int(header[2]) or batch.stdout.read(1) != b'\n':
+                          raise RuntimeError('truncated blob')
+                      expected = dict(path=path, mode=mode, blob=oid, sha256=sha(data))
+                      trusted.append(expected)
+                      p = ROOT / path
+                      try:
+                          st = p.lstat()
+                          # Do not follow symlink ancestors or hash link targets.
+                          if any(parent.is_symlink() for parent in p.parents if parent != ROOT and ROOT in parent.parents):
+                              raise RuntimeError('symlink ancestor')
+                          if stat.S_ISLNK(st.st_mode):
+                              actual_mode, actual = '120000', os.fsencode(os.readlink(p))
+                          elif stat.S_ISREG(st.st_mode):
+                              actual_mode = '100755' if st.st_mode & 0o111 else '100644'
+                              actual = p.read_bytes()
+                          else:
+                              raise RuntimeError('unsupported worktree type')
+                          blob = hashlib.sha1(b'blob ' + str(len(actual)).encode() + b'\0' + actual).hexdigest()
+                          row = dict(path=path, mode=actual_mode, blob=blob, sha256=sha(actual))
+                      except (OSError, RuntimeError) as exc:
+                          row = dict(path=path, error=str(exc))
+                      observed.append(row)
+                      if row != expected:
+                          mismatches.append(dict(expected=expected, observed=row))
+              finally:
+                  batch.stdin.close()
+                  batch.stdout.close()
+                  if batch.wait() != 0:
+                      raise RuntimeError('cat-file failed')
+              trusted_hash = save('trusted-manifest.json', trusted)
+              observed_hash = save(phase + '-manifest.json', observed)
+              head = git('rev-parse', 'HEAD').decode().strip()
+              status = git('status', '--porcelain=v1', '--untracked-files=all')
+              diff = git('diff', '--binary', 'HEAD')
+              index_diff = git('diff', '--cached', '--binary', 'HEAD')
+              (EVIDENCE / (phase + '-status.txt')).write_bytes(status)
+              (EVIDENCE / (phase + '-diff.patch')).write_bytes(diff)
+              (EVIDENCE / (phase + '-index.patch')).write_bytes(index_diff)
+              anchors = {row['path']: row['sha256'] for row in trusted if row['path'] in ANCHORS}
+              result = dict(observed_HEAD=head, trusted_manifest_sha256=trusted_hash,
+                            observed_manifest_sha256=observed_hash, mismatches=mismatches,
+                            anchor_hashes=anchors, clean=not (status or diff or index_diff))
+              save(phase + '-source.json', result)
+              if head != CANDIDATE or anchors != ANCHORS:
+                  raise RuntimeError('candidate HEAD or SPEC anchor mismatch')
+              if phase == 'before' and (mismatches or not result['clean']):
+                  raise RuntimeError('dirty or mismatched candidate before installation')
+              return result
+
+          def execute(name):
+              ledger = json.loads(STATE.read_text())
+              if name not in ledger or ledger[name]['state'] != 'NOT_RUN':
+                  raise RuntimeError('unplanned or repeated command: ' + name)
+              row = ledger[name]
+              row.update(state='INCONCLUSIVE', started=now(), exit_code=None,
+                         environment={key: os.environ.get(key) for key in ('TMPDIR', 'PYTHONDONTWRITEBYTECODE', 'WAG_EXPECTED_HEAD')})
+              save('commands.json', ledger)
+              # Separate complete stdout/stderr; also stream to platform logs.
+              with (EVIDENCE / (name + '.stdout')).open('wb', buffering=0) as out, (EVIDENCE / (name + '.stderr')).open('wb', buffering=0) as err:
+                  child = subprocess.Popen(['bash', '-e', '-o', 'pipefail', '-c', COMMANDS[name]], cwd=ROOT,
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                  logging_errors = []
+                  def pump(source, target, console):
+                      try:
+                          while True:
+                              chunk = source.read(8192)
+                              if not chunk:
+                                  break
+                              target.write(chunk)
+                              console.buffer.write(chunk)
+                              console.flush()
+                      except Exception as exc:
+                          logging_errors.append(str(exc))
+                      finally:
+                          source.close()
+                  threads = [threading.Thread(target=pump, args=(child.stdout, out, sys.stdout)),
+                             threading.Thread(target=pump, args=(child.stderr, err, sys.stderr))]
+                  for thread in threads:
+                      thread.start()
+                  code = child.wait()
+                  for thread in threads:
+                      thread.join()
+              row.update(ended=now(), exit_code=code, state='PASS' if code == 0 else 'FAIL')
+              if logging_errors:
+                  row.update(state='INCONCLUSIVE', logging_errors=logging_errors)
+              if name == 'offline':
+                  p = Path(os.environ['RUNNER_TEMP']) / 'wag-pipeline-exits.txt'
+                  if p.exists():
+                      row['pipeline_exit_codes'] = [int(x) for x in p.read_text().splitlines()]
+                  else:
+                      row['pipeline_exit_codes'] = None
+                      row['state'] = 'INCONCLUSIVE'
+              save('commands.json', ledger)
+              return code if row['state'] in ('PASS', 'FAIL') else 1
+
+          def before():
+              EVIDENCE.mkdir(exist_ok=False)
+              save('commands.json', {name: dict(command=COMMANDS[name], cwd=str(ROOT), state='NOT_RUN',
+                                               exit_code=None, reason='not started / prerequisite or platform interruption') for name in planned()})
+              identity = {key: os.environ.get(key) for key in (
+                  'WAG_REPOSITORY', 'WAG_EVENT', 'WAG_REF', 'WAG_EXPECTED_HEAD', 'WAG_CONTROL_SHA',
+                  'WAG_CONTROL_PATH', 'WAG_RUN_ID', 'WAG_RUN_ATTEMPT', 'WAG_JOB', 'WAG_KIND',
+                  'WAG_PYTHON', 'RUNNER_NAME', 'RUNNER_ARCH', 'WAG_LABEL', 'ImageOS', 'ImageVersion')}
+              identity.update(candidate_sha=CANDIDATE, control_workflow_sha=os.environ['WAG_CONTROL_SHA'],
+                              api_job_id='UNKNOWN: integrator must bind attempts/1/jobs API',
+                              candidate_acceptance='HOLD', timestamp=now())
+              save('identity.json', identity)
+              if (identity['WAG_REPOSITORY'] != 'williamxhero/searxng' or identity['WAG_EVENT'] != 'push'
+                      or identity['WAG_REF'] != 'refs/heads/ci/spec103-a-2829e93-control-v1'
+                      or identity['WAG_RUN_ATTEMPT'] != '1'):
+                  raise RuntimeError('unexpected repository/event/ref/attempt')
+              control = os.environ['WAG_CONTROL_SHA']
+              if not re.fullmatch(r'[0-9a-f]{40}', control) or control in (CANDIDATE, os.environ['WAG_BASE']):
+                  raise RuntimeError('invalid control identity')
+              # Read-only anonymous fetch; checkout credentials are not persisted.
+              subprocess.run(['git', 'fetch', '--no-tags', '--depth=2', 'https://github.com/williamxhero/searxng.git', control], cwd=ROOT, check=True)
+              parents = git('show', '-s', '--format=%P', control).decode().strip().split()
+              if parents != [os.environ['WAG_BASE']]:
+                  raise RuntimeError('control must be a single child of fixed base')
+              changes = git('diff-tree', '--no-commit-id', '--name-status', '-r', control).decode()
+              if changes != 'A\t' + os.environ['WAG_CONTROL_PATH'] + '\n':
+                  raise RuntimeError('control diff exceeds unique added workflow')
+              spec = control + ':' + os.environ['WAG_CONTROL_PATH']
+              blob = git('show', spec)
+              (EVIDENCE / 'control-workflow.yml').write_bytes(blob)
+              identity.update(control_workflow_blob_id=git('rev-parse', spec).decode().strip(), control_workflow_blob_sha256=sha(blob))
+              save('identity.json', identity)
+              snapshot('before')
+
+          def types():
+              tool = ROOT / 'local/py3/bin/basedpyright'
+              dependency = 'basedpyright==1.39.10' in (ROOT / 'requirements-dev.txt').read_text().splitlines()
+              if not tool.is_file() or not dependency:
+                  save('type-result.json', dict(state='TYPE_NOT_RUN', reason='candidate-installed tool missing', exit_code=None))
+                  return 1
+              version = execute('type_version')
+              help_code = execute('type_help')
+              if version != 0 or help_code != 0 or '--outputjson' not in (EVIDENCE / 'type_help.stdout').read_text():
+                  save('type-result.json', dict(state='TYPE_UNSUPPORTED', exit_code=None))
+                  return 1
+              code = execute('type')
+              try:
+                  data = json.loads((EVIDENCE / 'type.stdout').read_text())
+                  counts = data['summary']
+                  if not all(isinstance(counts.get(k), int) for k in ('errorCount', 'warningCount', 'informationCount')):
+                      raise ValueError('missing diagnostic counts')
+                  save('type-result.json', dict(state='PASS' if code == 0 and counts['errorCount'] == 0 else 'RED',
+                                                exit_code=code, summary=counts, executable=str(tool), resolved=str(tool.resolve())))
+                  return 0 if code == 0 and counts['errorCount'] == 0 else 1
+              except (ValueError, KeyError):
+                  save('type-result.json', dict(state='INCONCLUSIVE', exit_code=code, reason='invalid diagnostic JSON'))
+                  return 1
+
+          def environment():
+              # Explicit allowlist, never dump environment or credentials.
+              commands = [['uname', '-a'], ['python', '--version'], ['python', '-m', 'pip', '--version'],
+                          ['node', '--version'], ['npm', '--version'], ['unshare', '--version']]
+              venv = ROOT / ('local/protection-venv/bin/python' if KIND == 'protection' else 'local/py3/bin/python')
+              if venv.is_file():
+                  commands += [[str(venv), '--version'], [str(venv), '-m', 'pip', 'list', '--format=json'],
+                               [str(venv), '-m', 'pip', 'cache', 'list']]
+              records = []
+              for command in commands:
+                  path = shutil.which(command[0])
+                  if path is None:
+                      records.append(dict(command=command, state='NOT_RUN', exit_code=None))
+                      continue
+                  result = subprocess.run(command, cwd=ROOT, capture_output=True)
+                  records.append(dict(command=command, executable=path, exit_code=result.returncode,
+                                      stdout=result.stdout.decode(errors='replace'), stderr=result.stderr.decode(errors='replace')))
+              save('environment.json', records)
+              (EVIDENCE / 'os-release.txt').write_bytes(Path('/etc/os-release').read_bytes())
+
+          def finish():
+              failures = []
+              try:
+                  source = snapshot('after')
+                  if source['mismatches'] or not source['clean']:
+                      failures.append('GENERATED_DIFF_REVIEW_REQUIRED' if KIND == 'theme' else 'SOURCE_CHANGED_REVIEW_REQUIRED')
+              except Exception as exc:
+                  failures.append('SOURCE_INCONCLUSIVE: ' + str(exc))
+              environment()
+              ledger = json.loads(STATE.read_text())
+              failures += [name + ':' + row['state'] for name, row in ledger.items() if row['state'] != 'PASS']
+              if KIND == 'test' and os.environ['WAG_PYTHON'] == '3.12':
+                  p = EVIDENCE / 'type-result.json'
+                  if not p.exists() or json.loads(p.read_text())['state'] != 'PASS':
+                      failures.append('TYPE_RED_OR_NOT_RUN')
+              if KIND == 'protection':
+                  p = ROOT / 'local/protection-offline.log'
+                  if p.is_file():
+                      shutil.copyfile(p, EVIDENCE / 'protection-offline.log')
+                      log = p.read_text(errors='replace')
+                      footer = re.search(r'offline_tests=(\d+) native_positive_headers=(\d+) unexpected_skips=(\d+)', log)
+                      native = re.search(r'test_native_search_two_engines_same_query_complete_nonempty .*? \.\.\. ok', log)
+                      complete = (footer is not None and int(footer[1]) > 0 and int(footer[2]) > 0
+                                  and int(footer[3]) == 0 and native is not None
+                                  and 'offline_head=' + CANDIDATE in log and 'offline_artifact=' in log
+                                  and re.search(r'Ran \d+ tests? in ', log) is not None
+                                  and re.search(r'^OK$', log, re.MULTILINE) is not None)
+                      save('offline-result.json', dict(state='COMPLETE' if complete else 'INCONCLUSIVE',
+                                                      footer=footer.group(0) if footer else None))
+                      if not complete:
+                          failures.append('OFFLINE_EVIDENCE_INCONCLUSIVE')
+                  else:
+                      failures.append('OFFLINE_LOG_NOT_RUN_OR_MISSING')
+              save('result.json', dict(state='FAIL_OR_INCONCLUSIVE' if failures else 'ORIGINAL_COMMANDS_PASS',
+                                       failures=failures, candidate_acceptance='HOLD',
+                                       api_artifact_binding='NOT_RUN: integrator readback required'))
+              return 1 if failures else 0
+
+          def pack():
+              files = sorted(EVIDENCE.rglob('*'))
+              if any(p.is_symlink() or not p.is_file() for p in files):
+                  raise RuntimeError('unsupported evidence entry')
+              if len(files) > 1024:
+                  raise RuntimeError('EVIDENCE_LIMIT: file count')
+              index = [dict(path=str(p.relative_to(EVIDENCE)), bytes=p.stat().st_size, sha256=sha(p.read_bytes())) for p in files]
+              save('evidence-index.json', index)
+              files = sorted(EVIDENCE.iterdir())
+              raw = sum(p.stat().st_size for p in files)
+              if raw > 8 * 1024 * 1024:
+                  raise RuntimeError('EVIDENCE_LIMIT: complete raw evidence exceeds 8 MiB; no truncation/upload')
+              archive = Path(os.environ['RUNNER_TEMP']) / 'wag-evidence.zip'
+              with zipfile.ZipFile(archive, 'x', compression=zipfile.ZIP_STORED) as output:
+                  for p in files:
+                      output.write(p, p.name)
+              # Single bounded upload member: <=8 MiB-64KiB, leaving outer ZIP
+              # overhead far below the 2 MiB aggregate envelope margin.
+              if archive.stat().st_size > 8 * 1024 * 1024 - 65536:
+                  raise RuntimeError('EVIDENCE_LIMIT: packaged evidence; do not upload')
+              print(json.dumps(dict(archive_bytes=archive.stat().st_size, sha256=sha(archive.read_bytes()), raw_bytes=raw)))
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+                  output.write('ready=true\n')
+              return 0
+
+          if __name__ == '__main__':
+              try:
+                  operation = sys.argv[1]
+                  if operation == 'before':
+                      before()
+                      result = 0
+                  elif operation == 'execute':
+                      result = execute(sys.argv[2])
+                  elif operation == 'types':
+                      result = types()
+                  elif operation == 'finish':
+                      result = finish()
+                  elif operation == 'pack':
+                      result = pack()
+                  else:
+                      raise RuntimeError('unapproved operation')
+                  sys.exit(result)
+              except Exception as exc:
+                  if EVIDENCE.is_dir():
+                      save('controller-error-' + sys.argv[1] + '.json', dict(state='INCONCLUSIVE', error=str(exc), timestamp=now()))
+                  raise
+          PY
+          python3 "$RUNNER_TEMP/wag-control.py" before
+
+      - name: Setup Python without cache
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: ""
+      - name: Original install
+        id: install
+        run: python3 "$RUNNER_TEMP/wag-control.py" execute install
+      - name: Original isolated ci.test
+        if: ${{ !cancelled() && steps.identity.outcome == 'success' && steps.install.outcome == 'success' }}
+        run: python3 "$RUNNER_TEMP/wag-control.py" execute tests
+      - name: Separate direct global type diagnostic
+        if: ${{ !cancelled() && matrix.python-version == '3.12' && steps.identity.outcome == 'success' && steps.install.outcome == 'success' }}
+        run: python3 "$RUNNER_TEMP/wag-control.py" types
+      - name: Preserve post-run observations and enforce real results
+        if: always()
+        run: python3 "$RUNNER_TEMP/wag-control.py" finish
+      - name: Bound complete evidence package, never truncate
+        if: always()
+        id: pack
+        run: python3 "$RUNNER_TEMP/wag-control.py" pack
+      - name: Upload bounded evidence
+        if: ${{ always() && steps.pack.outputs.ready == 'true' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: wag-${{ github.run_id }}-1-test-${{ matrix.python-version }}
+          path: ${{ runner.temp }}/wag-evidence.zip
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
+
+  protection:
+    name: Offline protection exact HEAD
+    needs: test
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    env:
+      WAG_KIND: protection
+      WAG_PYTHON: "3.12"
+      WAG_LABEL: ubuntu-26.04
+    steps:
+      - name: Checkout fixed candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with: *candidate_checkout
+      - name: Verify source and control before setup/install
+        id: identity
+        shell: bash
+        run: *initialize
+      - name: Setup Python without cache
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.12"
+          cache: ""
+      - name: Original locked environment
+        id: venv
+        run: python3 "$RUNNER_TEMP/wag-control.py" execute venv
+      - name: Original hash-locked install
+        id: install
+        run: python3 "$RUNNER_TEMP/wag-control.py" execute locked_install
+      - name: Original offline native positive and regression gate
+        if: ${{ !cancelled() && steps.identity.outcome == 'success' && steps.install.outcome == 'success' }}
+        run: python3 "$RUNNER_TEMP/wag-control.py" execute offline
+      - name: Preserve post-run observations and enforce real results
+        if: always()
+        run: python3 "$RUNNER_TEMP/wag-control.py" finish
+      - name: Bound complete evidence package
+        if: always()
+        id: pack
+        run: python3 "$RUNNER_TEMP/wag-control.py" pack
+      - name: Upload bounded evidence
+        if: ${{ always() && steps.pack.outputs.ready == 'true' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: wag-${{ github.run_id }}-1-protection
+          path: ${{ runner.temp }}/wag-evidence.zip
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
+
+  theme:
+    name: Theme
+    needs: protection
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 20
+    env:
+      WAG_KIND: theme
+      WAG_PYTHON: "3.14"
+      WAG_LABEL: ubuntu-26.04-arm
+    steps:
+      - name: Checkout fixed candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with: *candidate_checkout
+      - name: Verify source and control before setup/install
+        id: identity
+        shell: bash
+        run: *initialize
+      - name: Setup Python without cache
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.14"
+          cache: ""
+      - name: Setup original Node without implicit package-manager cache
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: "26"
+          check-latest: "true"
+          cache: ""
+          package-manager-cache: "false"
+      - name: Original install
+        id: install
+        run: python3 "$RUNNER_TEMP/wag-control.py" execute install
+      - name: Original theme lint
+        run: python3 "$RUNNER_TEMP/wag-control.py" execute lint
+      - name: Original theme build
+        run: python3 "$RUNNER_TEMP/wag-control.py" execute build
+      - name: Preserve post-run observations and enforce real results
+        if: always()
+        run: python3 "$RUNNER_TEMP/wag-control.py" finish
+      - name: Bound complete evidence package
+        if: always()
+        id: pack
+        run: python3 "$RUNNER_TEMP/wag-control.py" pack
+      - name: Upload bounded evidence
+        if: ${{ always() && steps.pack.outputs.ready == 'true' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: wag-${{ github.run_id }}-1-theme
+          path: ${{ runner.temp }}/wag-evidence.zip
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
