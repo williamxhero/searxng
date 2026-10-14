@@ -344,6 +344,7 @@ class StoreTest(unittest.TestCase):
         self.advance(17)
         repeated = self.api.migrate_legacy(root, manifest=manifest, authorization='synthetic:repeat-validation')
         self.assertFalse(isinstance(repeated, self.api.Refusal))
+        assert not isinstance(repeated, self.api.Refusal)
         self.assertTrue((root / 'ledger.sqlite').read_bytes() == original_db, 'v2 repeat rewrote durable state')
         calls = []
         outcome = repeated.run_engine(
@@ -375,6 +376,7 @@ class StoreTest(unittest.TestCase):
                     db.execute('UPDATE poison SET rowid=rowid+100')
                 migrated = self.api.migrate_legacy(root, manifest=manifest, authorization='synthetic:retain-unknown')
                 self.assertFalse(isinstance(migrated, self.api.Refusal))
+                assert not isinstance(migrated, self.api.Refusal)
                 with sqlite3.connect(root / 'ledger.sqlite') as db:
                     self.assertEqual(db.execute('SELECT checkpoint FROM state').fetchone()[0], checkpoint)
                     self.assertEqual(
@@ -407,6 +409,7 @@ class StoreTest(unittest.TestCase):
             db.execute('UPDATE state SET checkpoint=?', (checkpoint,))
         migrated = self.api.migrate_legacy(root, manifest=manifest, authorization='synthetic:no-reanchor')
         self.assertFalse(isinstance(migrated, self.api.Refusal))
+        assert not isinstance(migrated, self.api.Refusal)
         with sqlite3.connect(root / 'ledger.sqlite') as db:
             self.assertEqual(db.execute('SELECT checkpoint FROM state').fetchone()[0], checkpoint)
             self.assertEqual(
@@ -702,18 +705,22 @@ print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
             )
             before = (self.root / 'ledger.sqlite').read_bytes()
             refused = self.api.recover(self.root, authorization=authorization, decision='combined', proof=proof)
+            assert isinstance(refused, self.api.Refusal)
             self.assertEqual(refused.reason, 'evidence_unknown')
             self.assertEqual((self.root / 'ledger.sqlite').read_bytes(), before)
             session.stop_sender(sender)
             result = self.api.recover(self.root, authorization=authorization, decision='combined', proof=proof)
             self.assertIs(type(result), self.api.RecoveryResult)
+            assert isinstance(result, self.api.RecoveryResult)
             self.assertEqual(
                 (result.recovery_id, result.decision, result.terminated_count, result.reanchored_count),
                 (1, 'combined', 1, 2),
             )
             after = (self.root / 'ledger.sqlite').read_bytes()
+            refused = self.api.recover(self.root, authorization=authorization, decision='combined', proof=proof)
+            assert isinstance(refused, self.api.Refusal)
             self.assertEqual(
-                self.api.recover(self.root, authorization=authorization, decision='combined', proof=proof).reason,
+                refused.reason,
                 'capability_refused',
             )
             self.assertEqual((self.root / 'ledger.sqlite').read_bytes(), after)
@@ -768,6 +775,7 @@ print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
                 result = self.api.recover(
                     self.root, authorization='synthetic:invalid-proof', decision='combined', proof=proof
                 )
+                assert isinstance(result, self.api.Refusal)
                 self.assertEqual(result.reason, 'capability_refused')
                 self.assertEqual((self.root / 'ledger.sqlite').read_bytes(), before)
         result = self.api.recover(
@@ -776,6 +784,7 @@ print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
             decision='combined',
             proof={'synthetic': True},
         )
+        assert isinstance(result, self.api.Refusal)
         self.assertEqual(result.reason, 'evidence_unknown')
         self.assertEqual((self.root / 'ledger.sqlite').read_bytes(), before)
 
@@ -796,12 +805,16 @@ print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
                 )
             proof = session.seal(clear_poison=())
             before = (self.root / 'ledger.sqlite').read_bytes()
+            refused = self.api.recover(self.root, authorization=authorization, decision='clock_reanchor', proof=proof)
+            assert isinstance(refused, self.api.Refusal)
             self.assertEqual(
-                self.api.recover(self.root, authorization=authorization, decision='clock_reanchor', proof=proof).reason,
+                refused.reason,
                 'capability_refused',
             )
+            refused = self.api.recover(self.root, authorization=authorization, decision='combined', proof=proof)
+            assert isinstance(refused, self.api.Refusal)
             self.assertEqual(
-                self.api.recover(self.root, authorization=authorization, decision='combined', proof=proof).reason,
+                refused.reason,
                 'evidence_unknown',
             )
             self.assertEqual((self.root / 'ledger.sqlite').read_bytes(), before)
@@ -812,6 +825,7 @@ print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
                 os.waitpid(binding.pid, os.WNOHANG)
             result = self.api.recover(self.root, authorization=authorization, decision='combined', proof=proof)
             self.assertIs(type(result), self.api.RecoveryResult)
+            assert isinstance(result, self.api.RecoveryResult)
             self.assertEqual(result.terminated_count, 1)
 
         for timing in ('before_seal', 'after_seal'):
@@ -849,10 +863,10 @@ print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
                                 session.seal()
                             self.assertEqual(error.exception.reason, 'evidence_unknown')
                         else:
+                            refused = self.api.recover(root, authorization=authorization, decision='combined', proof=proof)
+                            assert isinstance(refused, self.api.Refusal)
                             self.assertEqual(
-                                self.api.recover(
-                                    root, authorization=authorization, decision='combined', proof=proof
-                                ).reason,
+                                refused.reason,
                                 'evidence_unknown',
                             )
                         self.assertEqual((root / 'ledger.sqlite').read_bytes(), before)
@@ -877,11 +891,14 @@ print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
             before = (self.root / 'ledger.sqlite').read_bytes()
             with patch('wag_protection.ledger._commit', side_effect=sqlite3.OperationalError('synthetic commit fault')):
                 result = self.api.recover(self.root, authorization=authorization, decision='combined', proof=proof)
+            assert isinstance(result, self.api.Refusal)
             self.assertEqual(result.reason, 'storage_error')
             self.assertEqual((self.root / 'ledger.sqlite').read_bytes(), before)
             # Commit uncertainty consumes the proof; retry is refused rather than guessed.
+            refused = self.api.recover(self.root, authorization=authorization, decision='combined', proof=proof)
+            assert isinstance(refused, self.api.Refusal)
             self.assertEqual(
-                self.api.recover(self.root, authorization=authorization, decision='combined', proof=proof).reason,
+                refused.reason,
                 'capability_refused',
             )
 
@@ -988,6 +1005,7 @@ print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
 
                     with patch('sqlite3.connect', side_effect=connect):
                         result = self.api.recover(root, authorization=authorization, decision='combined', proof=proof)
+                    assert isinstance(result, self.api.Refusal)
                     self.assertEqual(result.reason, 'storage_error')
                     self.assertEqual(len(reached), 1, 'the intended real SQLite operation was not reached exactly once')
                     self.assertEqual(reached[0]['counts'], audit_counts)
@@ -1222,6 +1240,7 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
 
             with patch('os.fsync', side_effect=fail_directory_fsync):
                 result = self.api.recover(root, authorization=authorization, decision='combined', proof=proof)
+            assert isinstance(result, self.api.Refusal)
             self.assertEqual(result.reason, 'storage_error')
             self.assertEqual(observed, [1], 'failure did not occur after a real durable SQLite commit')
             after = (root / 'ledger.sqlite').read_bytes()
@@ -1243,8 +1262,10 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
                     (None, None, None, None),
                 )
                 self.assertEqual(db.execute('SELECT * FROM release_checks').fetchall(), old_release)
+            refused = self.api.recover(root, authorization=authorization, decision='combined', proof=proof)
+            assert isinstance(refused, self.api.Refusal)
             self.assertEqual(
-                self.api.recover(root, authorization=authorization, decision='combined', proof=proof).reason,
+                refused.reason,
                 'capability_refused',
             )
             self.assertTrue((root / 'ledger.sqlite').read_bytes() == after, 'uncertain recovery was retried')
@@ -1284,6 +1305,7 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
             if child == 0:
                 os.close(read_fd)
                 result = self.api.recover(root, authorization=authorization, decision='combined', proof=proof)
+                assert isinstance(result, self.api.Refusal)
                 os.write(write_fd, result.reason.encode('ascii'))
                 os._exit(0)
             os.close(write_fd)
@@ -1317,6 +1339,7 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
             )
             for value in (copied, object.__new__(Counterfeit), Callback(), b'serialized-proof', True, {}):
                 result = self.api.recover(root, authorization=authorization, decision='combined', proof=value)
+                assert isinstance(result, self.api.Refusal)
                 self.assertEqual(result.reason, 'capability_refused')
                 self.assertTrue((root / 'ledger.sqlite').read_bytes() == before)
             self.assertEqual(called, [])
@@ -1337,8 +1360,10 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
             before = (root / 'ledger.sqlite').read_bytes()
             clock = dict(self.now)
             self.advance(300)
+            refused = self.api.recover(root, authorization=authorization, decision='combined', proof=proof)
+            assert isinstance(refused, self.api.Refusal)
             self.assertEqual(
-                self.api.recover(root, authorization=authorization, decision='combined', proof=proof).reason,
+                refused.reason,
                 'evidence_unknown',
             )
             self.assertTrue((root / 'ledger.sqlite').read_bytes() == before)
@@ -1351,8 +1376,10 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
                 return original_read(path, *args, **kwargs)
 
             with patch.object(Path, 'read_text', changed_boot):
+                refused = self.api.recover(root, authorization=authorization, decision='combined', proof=proof)
+                assert isinstance(refused, self.api.Refusal)
                 self.assertEqual(
-                    self.api.recover(root, authorization=authorization, decision='combined', proof=proof).reason,
+                    refused.reason,
                     'evidence_unknown',
                 )
             self.assertTrue((root / 'ledger.sqlite').read_bytes() == before)
@@ -1397,6 +1424,7 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
                         self.assertNotEqual(path.stat().st_ino, original_inode)
                     before = (root / 'ledger.sqlite').read_bytes()
                     result = self.api.recover(root, authorization=authorization, decision='combined', proof=proof)
+                    assert isinstance(result, self.api.Refusal)
                     self.assertEqual(result.reason, 'identity_error')
                     self.assertTrue(
                         (root / 'ledger.sqlite').read_bytes() == before, 'binding refusal changed durable ledger bytes'
@@ -1433,6 +1461,7 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
             self.assertFalse(approved['registry'][0]['profile']['live_hold'])
             object.__setattr__(proof, 'approved_manifest', manifest)
             result = self.api.recover(root, authorization=authorization, decision='combined', proof=proof)
+            assert isinstance(result, self.api.Refusal)
             self.assertEqual(result.reason, 'provenance_error')
             self.assertTrue((root / 'ledger.sqlite').read_bytes() == before)
             object.__setattr__(proof, 'approved_manifest', approved)
@@ -1475,6 +1504,7 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
                     before = (root / 'ledger.sqlite').read_bytes()
                     result = self.api.recover(root, authorization=authorization, decision=decision, proof=proof)
                     if invalid:
+                        assert isinstance(result, self.api.Refusal)
                         self.assertEqual(
                             result.reason, 'evidence_unknown' if decision == 'clock_reanchor' else 'clock_error'
                         )
@@ -1484,6 +1514,7 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
                                 self.assertEqual(db.execute(f'SELECT count(*) FROM {audit}').fetchone()[0], 0)
                     else:
                         self.assertIs(type(result), self.api.RecoveryResult)
+                        assert isinstance(result, self.api.RecoveryResult)
                         self.assertEqual(
                             (result.terminated_count, result.reanchored_count),
                             (0, 1) if decision == 'clock_reanchor' else (1, 0),
@@ -1572,6 +1603,7 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
             ):
                 for target in (Path('/var/lib/wag-route-probe'), Path('/var/lib/wag-route-probe/unapproved-child')):
                     result = self.api.recover(target, authorization=authorization, decision='combined', proof=proof)
+                    assert isinstance(result, self.api.Refusal)
                     self.assertEqual(result.reason, 'evidence_unknown')
             self.assertTrue((root / 'ledger.sqlite').read_bytes() == before)
             result = self.api.recover(root, authorization=authorization, decision='combined', proof=proof)
