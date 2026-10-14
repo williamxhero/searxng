@@ -96,6 +96,12 @@ def _dispatch():
     context = CURRENT_DISPATCH.get()
     if context is None or context.phase != 'send':
         raise ProtectionError('helper_refused')
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:  # synchronous owner entering the explicit bridge
+        task = None
+    if task is not None and task is not context.async_task:
+        raise ProtectionError('capability_refused')
     context.check_deadline()
     return context
 
@@ -159,7 +165,10 @@ class GuardedStream(httpcore.AsyncNetworkStream):
             raise httpcore.WriteError() from None
 
     async def aclose(self):
-        self.writer.close()
+        # This connection is terminal, not reusable. Graceful TLS shutdown can
+        # wait for a peer beyond the shared deadline; abort closes the socket
+        # locally, and wait_closed still proves connection_lost before Task done.
+        self.writer.transport.abort()
         await self.writer.wait_closed()
 
     async def start_tls(self, ssl_context, server_hostname=None, timeout=None):

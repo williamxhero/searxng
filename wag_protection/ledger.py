@@ -621,6 +621,7 @@ class Dispatch:
         self.pid = os.getpid()
         self.owner_thread = threading.get_ident()
         self.async_thread = None
+        self.async_task = None
         self.dispatch_id = secrets.token_hex(16)
         self.rows = []
         self.active = True
@@ -636,6 +637,11 @@ class Dispatch:
         if (not self.active or self.pid != os.getpid() or CURRENT_DISPATCH.get() is not self
                 or threading.get_ident() not in (self.owner_thread, self.async_thread)):
             raise ProtectionError('capability_refused')
+        if threading.get_ident() == self.async_thread:
+            import asyncio  # imported only at the explicit bridge, not package import
+
+            if asyncio.current_task() is not self.async_task:
+                raise ProtectionError('capability_refused')
         if (self.observer is not None and self.observer.cancelled) or time.monotonic() >= self.deadline:
             if self.observer is not None:
                 self.unfinished = True
@@ -664,12 +670,16 @@ class Dispatch:
             raise ProtectionError('capability_refused')
         stopped = threading.Event()
         async def execute():
+            import asyncio
+
             token = CURRENT_DISPATCH.set(self)
             self.async_thread = threading.get_ident()
+            self.async_task = asyncio.current_task()
             try:
                 self.check_deadline()
                 return await operation()
             finally:
+                self.async_task = None
                 self.async_thread = None
                 CURRENT_DISPATCH.reset(token)
         future = concurrent.futures.Future()

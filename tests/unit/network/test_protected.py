@@ -99,16 +99,19 @@ class ProtectedTransportTest(unittest.TestCase):
     def setUp(self):
         original_socket = socket.socket
         original_resolve = socket.getaddrinfo
+        self.client_sockets = []
 
         class OnlyLoopbackSocket(original_socket):
             def connect(inner, address):
                 if isinstance(address, tuple) and not ipaddress.ip_address(address[0]).is_loopback:
                     raise AssertionError('nonloopback socket denied')
+                self.client_sockets.append((inner, address))
                 return super().connect(address)
 
             def connect_ex(inner, address):
                 if isinstance(address, tuple) and not ipaddress.ip_address(address[0]).is_loopback:
                     raise AssertionError('nonloopback socket denied')
+                self.client_sockets.append((inner, address))
                 return super().connect_ex(address)
 
         def only_loopback_resolve(host, *args, **kwargs):
@@ -190,6 +193,7 @@ class ProtectedTransportTest(unittest.TestCase):
 
     def parsed_request(self, name, *, verify, proxy=None):
         import httpx
+        from searx.network.client import get_loop
         from searx.network.protected import GuardedTransport
         engine, params = self.engine_request(name)
         async def request():
@@ -199,7 +203,7 @@ class ProtectedTransportTest(unittest.TestCase):
                 response.search_params = params
                 return response
         return self.store.run_engine(name, caller='native_search', deadline_mono=time.monotonic() + 3,
-                                     build=lambda: params, send=lambda context, request_params: asyncio.run(request()),
+                                     build=lambda: params, send=lambda context, request_params: context.run_async(request, get_loop()),
                                      parse=engine.response)
 
     def native_search_fixture(self):
@@ -393,6 +397,53 @@ print(json.dumps({'reason': getattr(result, 'reason', None), 'calls': calls}))
         reopened = self.api.open_store(root, manifest=manifest, mode='synthetic')
         self.assertNotEqual(getattr(reopened, 'reason', None), 'lock_busy')
 
+    def test_held_tls_peer_cancel_closes_socket_and_task_before_return(self):
+        import sqlite3
+        from flask import Flask
+        from searx.network.client import get_loop
+
+        search, root, manifest = self.native_search_fixture()
+        self.tls_server.body_release.clear()
+        sender_tasks, controller_errors = [], []
+        async def capture_senders():
+            return [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+        def cancel_handler():
+            try:
+                if not self.tls_server.request_entered.wait(3):
+                    raise AssertionError('native request did not reach TLS fixture')
+                sender_tasks.extend(asyncio.run_coroutine_threadsafe(capture_senders(), get_loop()).result(1))
+                search.cancel()
+            except BaseException as error:
+                controller_errors.append(error)
+        controller = threading.Thread(target=cancel_handler, daemon=True)
+        controller.start()
+        try:
+            with Flask('held-peer-stop-test').test_request_context('/search'):
+                container = search.search()
+            self.assertLess(time.monotonic() - search.start_time, 3.0)
+            self.assertFalse(self.tls_server.body_release.is_set(), 'peer was released before stop proof')
+            self.assertEqual(controller_errors, [])
+            self.assertTrue(sender_tasks)
+            self.assertTrue(all(task.done() for task in sender_tasks), 'sender Task is still pending')
+            self.assertTrue(any(task.cancelled() for task in sender_tasks))
+            sockets = [sock for sock, address in self.client_sockets
+                       if address[1] == self.tls_server.server_port]
+            self.assertTrue(sockets)
+            self.assertTrue(all(sock.fileno() == -1 for sock in sockets), 'actual client socket remains open')
+            self.assertEqual(search.outbound_protection['engines'][0]['outcome'], 'cancelled')
+            self.assertEqual(self.tls_server.headers, 1)
+            self.assertEqual(len(container.get_ordered_results()), 0)
+            with sqlite3.connect(root / 'ledger.sqlite') as db:
+                self.assertEqual(db.execute('SELECT engine,outcome FROM attempts').fetchall(), [('bing', 'cancelled')])
+                self.assertEqual(db.execute('SELECT reason FROM poison').fetchall(), [])
+            self.assertNotEqual(getattr(self.api.open_store(root, manifest=manifest, mode='synthetic'),
+                                        'reason', None), 'lock_busy')
+            pending = asyncio.run_coroutine_threadsafe(capture_senders(), get_loop()).result(1)
+            self.assertEqual(pending, [], 'residual async work after native Search return')
+        finally:
+            self.tls_server.body_release.set()
+            controller.join(3)
+
     def test_real_async_unconfirmed_cancel_retains_lock_null_and_poison(self):
         import httpx
         import sqlite3
@@ -501,9 +552,34 @@ print(json.dumps({'reason': getattr(result, 'reason', None), 'calls': calls}))
         self.assertEqual(result.result_count, 1)
         self.assertEqual((result.reservations, result.connection_attempts, result.http_attempts), (1, 1, 1))
 
+    def test_copied_context_child_task_refuses_before_real_socket_send(self):
+        import httpx
+        import sqlite3
+        from searx.engines import quark
+        from searx.network.client import get_loop
+        from searx.network.protected import GuardedTransport
+
+        async def operation():
+            async def unintended_child():
+                async with httpx.AsyncClient(transport=GuardedTransport(), trust_env=False) as client:
+                    return await client.get(f'http://127.0.0.1:{self.server.server_port}/')
+            return await asyncio.create_task(unintended_child())
+        result = self.store.run_engine('quark', caller='native_search', deadline_mono=time.monotonic() + 3,
+                                       build=lambda: None,
+                                       send=lambda context, request: context.run_async(operation, get_loop()),
+                                       parse=quark.response)
+        self.assertEqual((self.server.accepts, self.server.headers), (0, 0))
+        self.assertEqual(result.outcome, 'runtime_error')
+        self.assertEqual((result.reservations, result.connection_attempts, result.http_attempts), (1, 0, 0))
+        with sqlite3.connect(self.root / 'ledger.sqlite') as db:
+            self.assertEqual(db.execute('SELECT outcome,connection_attempted,http_attempted FROM attempts').fetchall(),
+                             [('runtime_error', 0, 0)])
+            self.assertEqual(db.execute('SELECT reason FROM poison').fetchall(), [])
+
     def test_missing_header_trace_refuses_before_socket_creation(self):
         import httpx
         from searx.engines import quark
+        from searx.network.client import get_loop
         from searx.network.protected import GuardedTransport
         async def request():
             transport = GuardedTransport(verify=True)
@@ -511,7 +587,7 @@ print(json.dumps({'reason': getattr(result, 'reason', None), 'calls': calls}))
             async with httpx.AsyncClient(transport=transport, trust_env=False) as client:
                 return await client.get(f'http://127.0.0.1:{self.server.server_port}/')
         result = self.store.run_engine('quark', caller='native_search', deadline_mono=time.monotonic() + 3,
-                                       build=lambda: None, send=lambda context, request_params: asyncio.run(request()),
+                                       build=lambda: None, send=lambda context, request_params: context.run_async(request, get_loop()),
                                        parse=quark.response)
         self.assertNotEqual(result.outcome, 'ok')
         self.assertEqual((self.server.accepts, self.server.headers), (0, 0))
@@ -525,6 +601,7 @@ print(json.dumps({'reason': getattr(result, 'reason', None), 'calls': calls}))
     def test_direct_http_charges_one_connect_and_header_and_real_quark_parser(self):
         import httpx
         from searx.engines import quark
+        from searx.network.client import get_loop
         from searx.network.protected import GuardedTransport
 
         async def request():
@@ -532,7 +609,7 @@ print(json.dumps({'reason': getattr(result, 'reason', None), 'calls': calls}))
                 return await client.get(f'http://127.0.0.1:{self.server.server_port}/', follow_redirects=False)
 
         result = self.store.run_engine('quark', caller='native_search', deadline_mono=time.monotonic() + 3,
-                                       build=lambda: None, send=lambda context, request_params: asyncio.run(request()),
+                                       build=lambda: None, send=lambda context, request_params: context.run_async(request, get_loop()),
                                        parse=quark.response)
         self.assertEqual(result.outcome, 'ok')
         self.assertEqual(result.result_count, 1)
