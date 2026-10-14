@@ -1008,7 +1008,7 @@ class _SyntheticMaintenanceSession:
         process = subprocess.Popen([sys.executable, '-I', '-S', '-c', _SYNTHETIC_SENDER],
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    text=True, close_fds=True)
-        record = {'process': process, 'pidfd': None, 'binding': None, 'reaped': False}
+        record: SenderRecord = {'process': process, 'pidfd': None, 'binding': None, 'reaped': False}
         self._records.append(record)
         try:
             if process.stdin is None or process.stdout is None:
@@ -1051,9 +1051,15 @@ class _SyntheticMaintenanceSession:
         if type(binding) is not SenderBinding or record is None or record['reaped']:
             raise ProtectionError('capability_refused')
         process = record['process']
-        process.stdin.write('x')
-        process.stdin.flush()
-        if not select.select([record['pidfd']], [], [], 5)[0]:
+        stdin = process.stdin
+        if stdin is None:
+            raise AttributeError("'NoneType' object has no attribute 'write'")
+        stdin.write('x')
+        stdin.flush()
+        pidfd = record['pidfd']
+        if pidfd is None:
+            raise TypeError('argument must be an int, or have a fileno() method.')
+        if not select.select([pidfd], [], [], 5)[0]:
             raise ProtectionError('evidence_unknown')
         pid, status = os.waitpid(binding.pid, 0)
         if pid != binding.pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
@@ -1063,13 +1069,19 @@ class _SyntheticMaintenanceSession:
 
     def seal(self, *, clear_poison=()):
         self._check_owner()
-        if self._proof is not None or not self._records or any(item['binding'] is None for item in self._records):
+        if self._proof is not None or not self._records:
             raise ProtectionError('evidence_unknown')
+        registered: list[SenderBinding] = []
+        for item in self._records:
+            binding = item['binding']
+            if binding is None:
+                raise ProtectionError('evidence_unknown')
+            registered.append(binding)
         if (type(clear_poison) is not tuple or len(clear_poison) > 64
                 or any(type(item) is not PoisonSelection for item in clear_poison)
                 or len({item.rowid for item in clear_poison}) != len(clear_poison)):
             raise ProtectionError('capability_refused')
-        bindings = tuple(item['binding'] for item in self._records)
+        bindings = tuple(registered)
         ids = tuple(attempt_id for binding in bindings for attempt_id in binding.attempt_ids)
         with self._store._locked(readonly=True) as db:
             unknown = tuple(row[0] for row in db.execute('SELECT attempt_id FROM attempts WHERE outcome IS NULL ORDER BY attempt_id'))
@@ -1099,6 +1111,8 @@ class _SyntheticMaintenanceSession:
                     process.kill()
                     process.wait(timeout=5)
             for pipe in (process.stdin, process.stdout, process.stderr):
+                if pipe is None:
+                    raise AttributeError("'NoneType' object has no attribute 'close'")
                 pipe.close()
             if fd is not None:
                 os.close(fd)
