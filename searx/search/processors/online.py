@@ -238,6 +238,36 @@ class OnlineProcessor(EngineProcessor):
         response.search_params = params
         return self.engine.response(response)
 
+    def search_protected(self, query, params, store, start_time, timeout_limit):
+        from wag_protection import EngineFailure  # pylint: disable=import-outside-toplevel
+
+        self.init_network_in_thread(start_time, timeout_limit)
+        def classified(operation):
+            try:
+                return operation()
+            except SearxEngineCaptchaException as error:
+                raise EngineFailure('captcha', suspension_s=error.suspended_time or 0) from None
+            except SearxEngineTooManyRequestsException as error:
+                raise EngineFailure('rate_limited', suspension_s=error.suspended_time or 0) from None
+            except SearxEngineAccessDeniedException as error:
+                raise EngineFailure('access_denied', suspension_s=error.suspended_time or 0) from None
+
+        def build():
+            self.engine.request(query, params)
+            if not params['url']:
+                raise EngineFailure('request_refused')
+            return params
+
+        def parse(response):
+            response.search_params = params
+            return classified(lambda: self.engine.response(response))
+
+        return store.run_engine(
+            self.engine.name, caller='native_search', deadline_mono=start_time + min(timeout_limit, 3.0),
+            build=build, send=lambda context, request_params: classified(lambda: self._send_http_request(request_params)),
+            parse=parse,
+        )
+
     def search(  # pyright: ignore[reportIncompatibleMethodOverride]
         self,
         query: str,

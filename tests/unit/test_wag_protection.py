@@ -80,7 +80,11 @@ def fixture_manifest(root, engines):
             *sorted((WORKSPACE / 'wag_protection').glob('*.py')),
             *(WORKSPACE / f'searx/engines/{entry["module"]}.py' for entry in engines),
             WORKSPACE / 'searx/data/engine_traits.json',
-            WORKSPACE / 'searx/network/client.py', WORKSPACE / 'searx/network/network.py',
+            WORKSPACE / 'searx/engines/__init__.py',
+            WORKSPACE / 'searx/settings.yml', WORKSPACE / 'searx/settings_defaults.py',
+            WORKSPACE / 'searx/network/__init__.py', WORKSPACE / 'searx/network/client.py',
+            WORKSPACE / 'searx/network/network.py', WORKSPACE / 'searx/network/protected.py',
+            WORKSPACE / 'searx/search/__init__.py', WORKSPACE / 'searx/search/processors/abstract.py',
             WORKSPACE / 'searx/search/processors/online.py',
         ]
     }
@@ -128,13 +132,12 @@ class StoreTest(unittest.TestCase):
             db.execute('ALTER TABLE attempts ADD COLUMN unreviewed_schema TEXT')
         calls = []
         result = self.api.open_store(self.root, manifest=self.manifest, mode='synthetic')
-        self.assertEqual(getattr(result, 'reason', None), 'schema_error')
         outcome = store.run_engine('bing', caller='probe', deadline_mono=self.now['mono'] + 3,
                                    build=lambda: calls.append('build'),
                                    send=lambda context, request: calls.append('send'),
                                    parse=lambda response: calls.append('parse') or [])
-        self.assertEqual(getattr(outcome, 'reason', None), 'schema_error')
-        self.assertEqual(calls, [])
+        self.assertEqual((getattr(result, 'reason', None), getattr(outcome, 'reason', None), calls),
+                         ('schema_error', 'schema_error', []))
 
     def test_fixed_schema_rejects_changed_objects_types_constraints_and_indices(self):
         mutations = [

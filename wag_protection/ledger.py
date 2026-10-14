@@ -654,4 +654,3 @@ def open_store(root, *, manifest, mode):
         return Refusal('storage_error')
     except (ValueError, TypeError, KeyError):
         return Refusal('schema_error')
-

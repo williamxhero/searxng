@@ -202,10 +202,19 @@ class ProtectedTransportTest(unittest.TestCase):
         from flask import Flask
         from searx import settings
         import searx.search
-        from searx.network.network import done
+        from searx.network import THREADLOCAL
+        from searx.network.network import NETWORKS, done
         from searx.search.models import EngineRef, SearchQuery
         from searx.network.protected import resolved_config_digest
 
+        previous_networks = dict(NETWORKS)
+        previous_thread_context = dict(THREADLOCAL.__dict__)
+        def restore_network_context():
+            NETWORKS.clear()
+            NETWORKS.update(previous_networks)
+            THREADLOCAL.__dict__.clear()
+            THREADLOCAL.__dict__.update(previous_thread_context)
+        self.addCleanup(restore_network_context)
         self.tls_fixture()
         engine_settings = [
             {'name': 'bing', 'engine': 'bing', 'categories': ['general'], 'shortcut': 'bi',

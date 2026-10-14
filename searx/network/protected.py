@@ -28,12 +28,6 @@ NETWORK_CONFIG_FIELDS = (
 )
 
 
-def enabled():
-    from searx import settings  # pylint: disable=import-outside-toplevel
-
-    return validate_settings(settings['outgoing'].get('wag_protection', {'enabled': False}))['enabled']
-
-
 def resolved_config_digest(engine_settings, outgoing):
     """Hash only current resolved, nonsecret settings, never the manifest's assertion."""
     def network_projection(value):
