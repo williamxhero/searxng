@@ -258,7 +258,9 @@ class StoreTest(unittest.TestCase):
         root, manifest, checkpoint = self.legacy_fixture()
         token = (root / 'identity').read_bytes()
         inode = (root / 'lock').stat().st_ino
-        self.assertEqual(self.api.open_store(root, manifest=manifest, mode='synthetic').reason, 'schema_error')
+        refused = self.api.open_store(root, manifest=manifest, mode='synthetic')
+        assert isinstance(refused, self.api.Refusal)
+        self.assertEqual(refused.reason, 'schema_error')
         migrated = self.api.migrate_legacy(root, manifest=manifest, authorization='synthetic:stage6-migration')
         self.assertFalse(isinstance(migrated, self.api.Refusal))
         self.assertTrue((root / 'identity').read_bytes() == token)
@@ -630,8 +632,10 @@ print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
                     else:
                         self.assertEqual(observed, stage)
                         # The true transaction is still held at this boundary.
+                        refused = self.api.open_store(root, manifest=manifest, mode='synthetic')
+                        assert isinstance(refused, self.api.Refusal)
                         self.assertEqual(
-                            self.api.open_store(root, manifest=manifest, mode='synthetic').reason, 'lock_busy'
+                            refused.reason, 'lock_busy'
                         )
                         process.kill()
                         process.wait(timeout=5)
@@ -675,6 +679,7 @@ print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
 
         self.assertEqual(self.attempt().outcome, 'empty')
         store = self.open()
+        assert not isinstance(store, self.api.Refusal)
         store.claim_release('3' * 32, self.manifest['artifact_digest'], self.manifest['config_digest'], 110.0)
         authorization = 'synthetic:stage9-physical-stop'
         with _SyntheticMaintenanceSession(
@@ -907,6 +912,7 @@ print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
         self.api.initialize_fixture(root, registry=self.engines, clock=lambda: dict(self.now))
         manifest = fixture_manifest(root, self.engines)
         store = self.api.open_store(root, manifest=manifest, mode='synthetic')
+        assert not isinstance(store, self.api.Refusal)
         outcome = store.run_engine(
             'bing',
             caller='probe',
@@ -1123,7 +1129,9 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
                         select.select([process.stdout], [], [], 5)[0], 'real commit boundary was not reached'
                     )
                     self.assertEqual(process.stdout.readline().strip(), stage)
-                    self.assertEqual(self.api.open_store(root, manifest=manifest, mode='synthetic').reason, 'lock_busy')
+                    refused = self.api.open_store(root, manifest=manifest, mode='synthetic')
+                    assert isinstance(refused, self.api.Refusal)
+                    self.assertEqual(refused.reason, 'lock_busy')
                     process.kill()
                     process.communicate(timeout=5)
                     self.assertEqual(process.returncode, -9)
@@ -1625,6 +1633,7 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
                 self.api.initialize_fixture(root, registry=self.engines, clock=lambda: dict(self.now))
                 manifest = fixture_manifest(root, self.engines)
                 store = self.api.open_store(root, manifest=manifest, mode='synthetic')
+                assert not isinstance(store, self.api.Refusal)
                 with sqlite3.connect(root / 'ledger.sqlite') as db:
                     db.execute(
                         'INSERT INTO recoveries VALUES (1,?,?,?,?,?,?,?)',
@@ -1681,6 +1690,7 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
 
     def test_unknown_attempt_column_refuses_before_callbacks(self):
         store = self.open()
+        assert not isinstance(store, self.api.Refusal)
         with sqlite3.connect(self.root / 'ledger.sqlite') as db:
             db.execute('ALTER TABLE attempts ADD COLUMN unreviewed_schema TEXT')
         calls = []
@@ -1727,11 +1737,15 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
     def test_build_failure_is_charged_durably_before_callback(self):
         def build():
             # A nested public read must see the parser/dispatch lock, not a permit.
-            nested = self.open().public_snapshot(self.manifest['artifact_digest'], self.manifest['config_digest'])
+            snapshot_store = self.open()
+            assert not isinstance(snapshot_store, self.api.Refusal)
+            nested = snapshot_store.public_snapshot(self.manifest['artifact_digest'], self.manifest['config_digest'])
+            assert isinstance(nested, self.api.Refusal)
             self.assertEqual(nested.reason, 'lock_busy')
             raise ValueError('synthetic request failure')
 
         store = self.open()
+        assert not isinstance(store, self.api.Refusal)
         for _ in range(6):
             result = store.run_engine(
                 'bing',
@@ -1744,6 +1758,7 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
             self.assertEqual(result.outcome, 'request_refused')
             self.assertEqual(result.reservations, 1)
         reopened = self.open()
+        assert not isinstance(reopened, self.api.Refusal)
         seventh = reopened.run_engine(
             'bing',
             caller='native_search',
@@ -1757,7 +1772,9 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
     def attempt(
         self, engine='bing', *, build=lambda: None, parse=lambda response: [], send=lambda context, request: None
     ):
-        return self.open().run_engine(
+        store = self.open()
+        assert not isinstance(store, self.api.Refusal)
+        return store.run_engine(
             engine, caller='native_search', deadline_mono=self.now['mono'] + 3, build=build, send=send, parse=parse
         )
 
@@ -1776,7 +1793,9 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
             self.fail('refused attempt called build')
 
         self.assertEqual(self.attempt('unreviewed', build=forbidden).reason, 'capability_refused')
-        result = self.open().run_engine(
+        store = self.open()
+        assert not isinstance(store, self.api.Refusal)
+        result = store.run_engine(
             'bing',
             caller='native_search',
             deadline_mono=self.now['mono'],
@@ -1816,7 +1835,9 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
         calls = []
 
         def attempt(name, caller='probe'):
-            return self.api.open_store(root, manifest=manifest, mode='synthetic').run_engine(
+            store = self.api.open_store(root, manifest=manifest, mode='synthetic')
+            assert not isinstance(store, self.api.Refusal)
+            return store.run_engine(
                 name,
                 caller=caller,
                 deadline_mono=self.now['mono'] + 3,
@@ -1870,6 +1891,7 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
                 self.api.initialize_fixture(root, registry=self.engines, clock=lambda: dict(self.now))
                 manifest = fixture_manifest(root, self.engines)
                 store = self.api.open_store(root, manifest=manifest, mode='synthetic')
+                assert not isinstance(store, self.api.Refusal)
                 calls = []
                 self.now[field] = value
                 result = store.run_engine(
@@ -1886,9 +1908,12 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
                 with sqlite3.connect(root / 'ledger.sqlite') as db:
                     self.assertEqual(db.execute('SELECT reason FROM poison').fetchall(), [('clock_error',)])
                     self.assertEqual(db.execute('SELECT count(*) FROM attempts').fetchone()[0], 0)
-                snapshot = self.api.open_store(root, manifest=manifest, mode='synthetic').public_snapshot(
+                snapshot_store = self.api.open_store(root, manifest=manifest, mode='synthetic')
+                assert not isinstance(snapshot_store, self.api.Refusal)
+                snapshot = snapshot_store.public_snapshot(
                     manifest['artifact_digest'], manifest['config_digest']
                 )
+                assert isinstance(snapshot, self.api.Refusal)
                 self.assertEqual(snapshot.reason, 'clock_error')
 
     def test_changed_boot_poison_does_not_expire_or_refund_charge(self):
@@ -2064,6 +2089,7 @@ store.run_engine('bing', caller='probe', deadline_mono=103.0,
 
     def test_release_receipt_unlocks_before_one_ingress_and_cannot_replay(self):
         store = self.open()
+        assert not isinstance(store, self.api.Refusal)
         release_id = '1' * 32
         artifact, config = self.manifest['artifact_digest'], self.manifest['config_digest']
         receipt = store.claim_release(release_id, artifact, config, self.now['mono'] + 10)
@@ -2071,9 +2097,15 @@ store.run_engine('bing', caller='probe', deadline_mono=103.0,
 
         def operation():
             calls.append('operation')
-            self.assertEqual(self.open().consume_release_ingress(release_id, artifact, config), True)
+            ingress_store = self.open()
+            assert not isinstance(ingress_store, self.api.Refusal)
+            self.assertEqual(ingress_store.consume_release_ingress(release_id, artifact, config), True)
+            ingress_store = self.open()
+            assert not isinstance(ingress_store, self.api.Refusal)
+            refused = ingress_store.consume_release_ingress(release_id, artifact, config)
+            assert isinstance(refused, self.api.Refusal)
             self.assertEqual(
-                self.open().consume_release_ingress(release_id, artifact, config).reason, 'release_consumed'
+                refused.reason, 'release_consumed'
             )
             return {
                 'version': 2,
@@ -2095,34 +2127,66 @@ store.run_engine('bing', caller='probe', deadline_mono=103.0,
 
         evidence = store.run_release_check(receipt, operation)
         self.assertEqual(evidence['search']['status'], 'passed')
-        self.assertEqual(store.run_release_check(receipt, operation).reason, 'release_consumed')
+        refused = store.run_release_check(receipt, operation)
+        assert isinstance(refused, self.api.Refusal)
+        self.assertEqual(refused.reason, 'release_consumed')
+        release_store = self.open()
+        assert not isinstance(release_store, self.api.Refusal)
+        refused = release_store.claim_release(release_id, artifact, config, self.now['mono'] + 10)
+        assert isinstance(refused, self.api.Refusal)
         self.assertEqual(
-            self.open().claim_release(release_id, artifact, config, self.now['mono'] + 10).reason, 'release_consumed'
+            refused.reason, 'release_consumed'
         )
         self.assertEqual(calls, ['operation'])
-        self.assertEqual(self.open().public_snapshot(artifact, config)['age_s'], 0)
+        snapshot_store = self.open()
+        assert not isinstance(snapshot_store, self.api.Refusal)
+        snapshot = snapshot_store.public_snapshot(artifact, config)
+        assert not isinstance(snapshot, self.api.Refusal)
+        self.assertEqual(snapshot['age_s'], 0)
         self.advance(60.001)
-        self.assertEqual(self.open().public_snapshot(artifact, config).reason, 'evidence_unknown')
+        snapshot_store = self.open()
+        assert not isinstance(snapshot_store, self.api.Refusal)
+        snapshot = snapshot_store.public_snapshot(artifact, config)
+        assert isinstance(snapshot, self.api.Refusal)
+        self.assertEqual(snapshot.reason, 'evidence_unknown')
 
     def test_release_operation_crash_consumes_claim_permanently(self):
         store = self.open()
+        assert not isinstance(store, self.api.Refusal)
         artifact, config = self.manifest['artifact_digest'], self.manifest['config_digest']
         release_id = '2' * 32
         receipt = store.claim_release(release_id, artifact, config, self.now['mono'] + 10)
 
         def operation():
-            self.assertEqual(self.open().consume_release_ingress(release_id, artifact, config), True)
+            ingress_store = self.open()
+            assert not isinstance(ingress_store, self.api.Refusal)
+            self.assertEqual(ingress_store.consume_release_ingress(release_id, artifact, config), True)
             raise ValueError('synthetic operation failure')
 
-        self.assertEqual(store.run_release_check(receipt, operation).reason, 'evidence_unknown')
-        self.assertEqual(self.open().consume_release_ingress(release_id, artifact, config).reason, 'release_consumed')
-        self.assertEqual(self.open().public_snapshot(artifact, config).reason, 'evidence_unknown')
-        self.assertEqual(self.open().consume_release_ingress('3' * 32, artifact, config).reason, 'release_consumed')
+        refused = store.run_release_check(receipt, operation)
+        assert isinstance(refused, self.api.Refusal)
+        self.assertEqual(refused.reason, 'evidence_unknown')
+        ingress_store = self.open()
+        assert not isinstance(ingress_store, self.api.Refusal)
+        refused = ingress_store.consume_release_ingress(release_id, artifact, config)
+        assert isinstance(refused, self.api.Refusal)
+        self.assertEqual(refused.reason, 'release_consumed')
+        snapshot_store = self.open()
+        assert not isinstance(snapshot_store, self.api.Refusal)
+        snapshot = snapshot_store.public_snapshot(artifact, config)
+        assert isinstance(snapshot, self.api.Refusal)
+        self.assertEqual(snapshot.reason, 'evidence_unknown')
+        ingress_store = self.open()
+        assert not isinstance(ingress_store, self.api.Refusal)
+        refused = ingress_store.consume_release_ingress('3' * 32, artifact, config)
+        assert isinstance(refused, self.api.Refusal)
+        self.assertEqual(refused.reason, 'release_consumed')
 
     def test_missing_store_never_creates_state(self):
         root = Path(self.parent.name) / 'missing'
         manifest = {**self.manifest, 'root': str(root)}
         result = self.api.open_store(root, manifest=manifest, mode='synthetic')
+        assert isinstance(result, self.api.Refusal)
         self.assertEqual(result.reason, 'identity_error')
         self.assertFalse(root.exists())
 
@@ -2141,8 +2205,10 @@ store.run_engine('bing', caller='probe', deadline_mono=103.0,
             {**self.manifest, 'python_digest': '0' * 64},
         ]:
             with self.subTest(manifest=list(manifest)):
+                refused = self.api.open_store(self.root, manifest=manifest, mode='synthetic')
+                assert isinstance(refused, self.api.Refusal)
                 self.assertEqual(
-                    self.api.open_store(self.root, manifest=manifest, mode='synthetic').reason, 'provenance_error'
+                    refused.reason, 'provenance_error'
                 )
 
 
