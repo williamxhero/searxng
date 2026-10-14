@@ -61,6 +61,7 @@ class Network:
         '_proxies_cycle',
         '_clients',
         '_logger',
+        'protected',
     )
 
     _TOR_CHECK_RESULT = {}
@@ -81,8 +82,10 @@ class Network:
         retry_on_http_error: bool = False,
         max_redirects: int = 30,
         logger_name: str = None,  # pyright: ignore[reportArgumentType]
+        protected: bool = False,
     ):
 
+        self.protected = protected
         self.enable_http = enable_http
         self.verify = verify
         self.enable_http2 = enable_http2
@@ -102,6 +105,13 @@ class Network:
         self.check_parameters()
 
     def check_parameters(self):
+        if self.protected:
+            from wag_protection import ProtectionError  # pylint: disable=import-outside-toplevel
+
+            if self.using_tor_proxy or any(
+                httpx.URL(url).scheme not in ('http', 'https') for _, urls in self.iter_proxies() for url in urls
+            ):
+                raise ProtectionError('route_unsupported')
         for address in self.iter_ipaddresses():
             if '/' in address:
                 ipaddress.ip_network(address, False)
@@ -188,12 +198,22 @@ class Network:
         return result
 
     async def get_client(self, verify: bool | None = None, max_redirects: int | None = None) -> httpx.AsyncClient:
+        from searx import settings  # pylint: disable=import-outside-toplevel
+
+        if settings['outgoing'].get('wag_protection', {}).get('enabled', False) is not False and not self.protected:
+            from wag_protection import ProtectionError  # pylint: disable=import-outside-toplevel
+
+            raise ProtectionError('capability_refused')
+        if self.protected:
+            from .protected import _dispatch  # pylint: disable=import-outside-toplevel
+
+            _dispatch()
         verify = self.verify if verify is None else verify
         max_redirects = self.max_redirects if max_redirects is None else max_redirects
         local_address = next(self._local_addresses_cycle)
         proxies = next(self._proxies_cycle)  # is a tuple so it can be part of the key
         key = (verify, max_redirects, local_address, proxies)
-        hook_log_response = self.log_response if sxng_debug else None
+        hook_log_response = self.log_response if sxng_debug and not self.protected else None
         if key not in self._clients or self._clients[key].is_closed:
             client = new_client(
                 self.enable_http,
@@ -207,6 +227,7 @@ class Network:
                 0,
                 max_redirects,
                 hook_log_response,
+                protected=self.protected,
             )
             if self.using_tor_proxy and not await self.check_tor_proxy(client, proxies):
                 await client.aclose()
@@ -270,6 +291,28 @@ class Network:
         return True
 
     async def call_client(self, stream: bool, method: str, url: str, **kwargs: t.Any) -> SXNG_Response:
+        if self.protected:
+            from wag_protection import EngineFailure, ProtectionError  # pylint: disable=import-outside-toplevel
+            from .protected import _dispatch  # pylint: disable=import-outside-toplevel
+
+            _dispatch()
+            if stream:
+                raise ProtectionError('helper_refused')
+            do_raise = Network.extract_do_raise_for_httperror(kwargs)
+            kwargs_clients = Network.extract_kwargs_clients(kwargs)
+            kwargs['follow_redirects'] = False
+            client = await self.get_client(**kwargs_clients)
+            client.cookies = httpx.Cookies(kwargs.pop('cookies', None))
+            try:
+                response = await client.request(method, url, **kwargs)
+            except httpx.TimeoutException:
+                raise EngineFailure('timeout') from None
+            if 300 <= response.status_code < 400:
+                raise EngineFailure('redirect_refused')
+            response.ok = not response.is_error
+            if do_raise:
+                raise_for_httperror(response)
+            return response
         retries = self.retries
         was_disconnected = False
         do_raise_for_httperror = Network.extract_do_raise_for_httperror(kwargs)
@@ -345,6 +388,7 @@ def initialize(
 
     settings_engines = settings_engines or settings['engines']
     settings_outgoing = settings_outgoing or settings['outgoing']
+    protection_enabled = settings_outgoing.get('wag_protection', {}).get('enabled') is True
 
     # default parameters for AsyncHTTPTransport
     # see https://github.com/encode/httpx/blob/e05a5372eb6172287458b37447c30f650047e1b8/httpx/_transports/default.py#L108-L121  # pylint: disable=line-too-long
@@ -368,6 +412,8 @@ def initialize(
         result = {}
         result.update(default_params)  # pyright: ignore[reportUnknownMemberType]
         result.update(params)  # pyright: ignore[reportUnknownMemberType]
+        if protection_enabled:
+            result['protected'] = True
         if logger_name:
             result['logger_name'] = logger_name
         return Network(**result)  # type: ignore

@@ -9,6 +9,19 @@ from tests import SearxTestCase
 
 class TestWebUtils(SearxTestCase):
 
+    def test_json_off_preserves_exact_existing_payload(self):
+        from searx.results import ResultContainer
+        from searx.search.models import SearchQuery
+
+        query = SearchQuery('offline compatibility', [])
+        response = webutils.get_json_response(query, ResultContainer())
+        self.assertEqual(
+            response,
+            '{"query": "offline compatibility", "results": [], "answers": [], '
+            '"corrections": [], "infoboxes": [], "suggestions": [], '
+            '"unresponsive_engines": []}',
+        )
+
     @parameterized.expand(
         [
             ('https://searx.me/', 'https://searx.me/'),

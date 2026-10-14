@@ -128,6 +128,10 @@ def load_engine(engine_data: dict[str, t.Any]) -> "Engine | types.ModuleType | N
     if module_name is None:
         logger.error('The "engine" field is missing for the engine named "{}"'.format(engine_name))
         return None
+    if settings['outgoing'].get('wag_protection', {}).get('enabled', False) is not False:
+        from searx.network.protected import validate_engine_settings  # pylint: disable=import-outside-toplevel
+
+        validate_engine_settings(engine_data)
     try:
         engine = load_module(module_name + '.py', ENGINE_DIR)
     except (SyntaxError, KeyboardInterrupt, SystemExit, SystemError, ImportError, RuntimeError):
