@@ -2,6 +2,7 @@
 """SQLite accounting under one nonblocking, process-owned Linux flock."""
 
 import concurrent.futures
+from collections.abc import Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
 import errno
@@ -20,6 +21,7 @@ import stat
 import tempfile
 import threading
 import time
+from typing import TypeGuard, TypedDict, cast
 from urllib.parse import quote
 
 from .contract import (
@@ -81,7 +83,22 @@ TABLES = frozenset((
     'state', 'contract_meta', 'engine_identities', 'aliases', 'attempts', 'pauses', 'poison',
     'release_checks', 'recoveries', 'recovery_attempts', 'recovery_pauses',
 ))
-CURRENT_DISPATCH = ContextVar('wag_protection_dispatch', default=None)
+
+
+class ClockSample(TypedDict):
+    wall: float
+    mono: float
+    boot: str
+
+
+class SenderRecord(TypedDict):
+    process: subprocess.Popen[str]
+    pidfd: int | None
+    binding: SenderBinding | None
+    reaped: bool
+
+
+CURRENT_DISPATCH: ContextVar['Dispatch | None'] = ContextVar('wag_protection_dispatch', default=None)
 # Only lock descriptors are tracked here, never a dispatch, DB or send permit.
 _LOCK_FDS = set()
 _LOCK_FDS_MUTEX = threading.Lock()
@@ -118,18 +135,20 @@ def _close_lock(fd, pid):
             os.close(fd)
 
 
-def _clock():
+def _clock() -> ClockSample:
     return {'wall': time.time(), 'mono': time.monotonic(),
             'boot': Path('/proc/sys/kernel/random/boot_id').read_text(encoding='ascii').strip()}
 
 
-def _valid_clock(clock):
-    return (isinstance(clock, dict) and set(clock) == {'wall', 'mono', 'boot'}
-            and finite(clock['wall']) and finite(clock['mono'])
-            and isinstance(clock['boot'], str) and 0 < len(clock['boot']) <= 128)
+def _valid_clock(clock: object) -> TypeGuard[ClockSample]:
+    if not isinstance(clock, dict) or set(clock) != {'wall', 'mono', 'boot'}:
+        return False
+    sample = cast(dict[str, object], clock)
+    return (finite(sample['wall']) and finite(sample['mono'])
+            and isinstance(sample['boot'], str) and 0 < len(sample['boot']) <= 128)
 
 
-def _clock_matches(previous, now):
+def _clock_matches(previous: object, now: object) -> bool:
     return (_valid_clock(previous) and _valid_clock(now) and previous['boot'] == now['boot']
             and now['wall'] >= previous['wall'] and now['mono'] >= previous['mono']
             and abs((now['wall'] - previous['wall']) - (now['mono'] - previous['mono'])) <= 2.0)
@@ -321,7 +340,7 @@ class Store:
         self.pid = os.getpid()
 
     @contextmanager
-    def _locked(self, *, readonly=False, migration=False):
+    def _locked(self, *, readonly=False, migration=False) -> Generator[sqlite3.Connection, None, None]:
         if self.pid != os.getpid():
             raise ProtectionError('capability_refused')
         for path, directory in ((self.root, True), (self.root / 'lock', False),
@@ -335,7 +354,7 @@ class Store:
                 if suffix != '-journal':
                     raise ProtectionError('schema_error')
         fd = _open_lock(self.root / 'lock')
-        db = None
+        db: sqlite3.Connection | None = None
         try:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -355,6 +374,7 @@ class Store:
                 self._validate_legacy(db)
             else:
                 self._validate(db)
+            assert db is not None
             yield db
         finally:
             if db is not None and os.getpid() == self.pid:
@@ -873,11 +893,12 @@ class Dispatch:
             self.observer._record_reservation()
 
 
-def _freeze_manifest(value):
+def _freeze_manifest(value: object) -> object:
     if type(value) is dict:
-        return MappingProxyType({key: _freeze_manifest(item) for key, item in value.items()})
+        mapping = cast(dict[str, object], value)
+        return MappingProxyType({key: _freeze_manifest(item) for key, item in mapping.items()})
     if type(value) is list:
-        return tuple(_freeze_manifest(item) for item in value)
+        return tuple(_freeze_manifest(item) for item in cast(list[object], value))
     return value
 
 
@@ -952,7 +973,7 @@ class _SyntheticMaintenanceSession:
         self._issued = _clock()
         if not _valid_clock(self._issued) or len(self._issued['boot'].encode('utf-8')) > 128:
             raise ProtectionError('clock_error')
-        self._records = []
+        self._records: list[SenderRecord] = []
         self._proof = None
         self._capability = None
         self._used = False
@@ -990,6 +1011,8 @@ class _SyntheticMaintenanceSession:
         record = {'process': process, 'pidfd': None, 'binding': None, 'reaped': False}
         self._records.append(record)
         try:
+            if process.stdin is None or process.stdout is None:
+                raise ProtectionError('evidence_unknown')
             record['pidfd'] = os.pidfd_open(process.pid, 0)
             birth = Path(f'/proc/{process.pid}/stat').read_text(encoding='ascii').rsplit(')', 1)[1].split()
             if int(birth[1]) != self._pid:
@@ -1116,7 +1139,7 @@ def _recovery_witness(root, authorization, decision, proof):
     return session, store, now
 
 
-def recover(root, *, authorization, decision, proof):
+def recover(root, *, authorization, decision, proof) -> RecoveryResult | Refusal:
     """Audited synthetic-only maintenance. Never returns a sending permit."""
     if (not recovery_authorization(authorization) or type(decision) is not str
             or decision not in RECOVERY_DECISIONS):
@@ -1175,6 +1198,8 @@ def recover(root, *, authorization, decision, proof):
                 '(authorization,old_checkpoint,old_poison_json,new_boot,wall,mono,decision) VALUES (?,?,?,?,?,?,?)',
                 (authorization, old_checkpoint, canonical_json([reason for _, reason in poison]),
                  now['boot'], now['wall'], now['mono'], decision)).lastrowid
+            if recovery_id is None:
+                raise sqlite3.OperationalError('recovery row was not assigned an id')
             db.executemany('INSERT INTO recovery_attempts VALUES (?,?,?)',
                            [(recovery_id, attempt_id, text) for attempt_id, text in audit_rows])
             db.executemany('INSERT INTO recovery_pauses VALUES (?,?,?,?)',
@@ -1202,7 +1227,7 @@ def recover(root, *, authorization, decision, proof):
         return Refusal('provenance_error')
 
 
-def migrate_legacy(root, *, manifest, authorization):
+def migrate_legacy(root, *, manifest, authorization) -> Store | Refusal:
     """Offline maintenance; the caller must stop all cooperative senders first.
 
     Authorization is a nonsecret operation reference (1..256 UTF-8 bytes,
@@ -1268,7 +1293,7 @@ def migrate_legacy(root, *, manifest, authorization):
         return Refusal('schema_error')
 
 
-def open_store(root, *, manifest, mode, readonly=False):
+def open_store(root, *, manifest, mode, readonly=False) -> Store | Refusal:
     try:
         root = canonical_path(root)
         approved = validate_manifest(manifest, root, mode)

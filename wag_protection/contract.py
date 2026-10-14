@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import sys
+from typing import Literal, NotRequired, TypedDict, cast
 
 CONTRACT = 'wag.outbound.v2'
 VERSION = 2
@@ -37,6 +38,21 @@ MANIFEST_FIELDS = frozenset((
 ARTIFACT_FIELDS = (
     'contract', 'fork_commit', 'files', 'distributions', 'wheels', 'registry_digest', 'python_digest',
 )
+
+
+class DisabledSettings(TypedDict):
+    enabled: Literal[False]
+    root: NotRequired[str | os.PathLike[str]]
+    artifact_manifest: NotRequired[str | os.PathLike[str]]
+
+
+class EnabledSettings(TypedDict):
+    enabled: Literal[True]
+    root: str | os.PathLike[str]
+    artifact_manifest: str | os.PathLike[str]
+
+
+Settings = DisabledSettings | EnabledSettings
 
 
 @dataclass(frozen=True)
@@ -205,19 +221,21 @@ def canonical_path(value):
     return path
 
 
-def validate_settings(value):
+def validate_settings(value: object) -> Settings:
     """Validate raw protection values before SearXNG's bool coercion."""
     if not isinstance(value, dict) or set(value) - {'enabled', 'root', 'artifact_manifest'}:
         raise ValueError('invalid protection configuration')
-    if type(value.get('enabled', False)) is not bool:
+    raw = cast(dict[str, object], value)
+    enabled = raw.get('enabled', False)
+    if type(enabled) is not bool:
         raise ValueError('protection enabled must be a boolean')
-    result = {'enabled': False, **value}
+    result = {'enabled': False, **raw}
     for key in ('root', 'artifact_manifest'):
-        if key in value:
-            canonical_path(value[key])
-        elif result['enabled']:
+        if key in raw:
+            canonical_path(raw[key])
+        elif enabled:
             raise ValueError('missing protection path')
-    return result
+    return cast(Settings, result)
 
 
 def validate_evidence(value):
