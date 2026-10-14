@@ -61,6 +61,16 @@ class Search:
         self.result_container: ResultContainer = ResultContainer()
         self.start_time: float | None = None
         self.actual_timeout: float | None = None
+        self._protection_lock = threading.Lock()
+        self._protection_cancelled = False
+        self._protection_observer = None
+
+    def cancel(self):
+        """Notify this Search's protected worker; never touch its ledger or lock."""
+        with self._protection_lock:
+            self._protection_cancelled = True
+            if self._protection_observer is not None:
+                self._protection_observer.cancel()
 
     def search_external_bang(self) -> bool:
         """Check if there is a external bang.  If yes, update
@@ -165,7 +175,7 @@ class Search:
                     PROCESSORS[th._engine_name].logger.error('engine timeout')
 
     def _search_protected(self, store, requests):
-        from wag_protection import Refusal  # pylint: disable=import-outside-toplevel
+        from wag_protection import DispatchNotification, Refusal  # pylint: disable=import-outside-toplevel
 
         aliases = {} if isinstance(store, Refusal) else {
             alias: entry['engine'] for entry in store.manifest['registry'] for alias in entry['aliases']
@@ -193,22 +203,38 @@ class Search:
                 ref.update(reason='deadline_exceeded', deadline_exceeded=True)
                 continue
             completed = []
-            def work(processor=processor, params=params, completed=completed):
+            observer = DispatchNotification()
+            with self._protection_lock:
+                if self._protection_cancelled:
+                    ref.update(reason='cancelled')
+                    continue
+                self._protection_observer = observer
+            def work(processor=processor, params=params, completed=completed, observer=observer):
                 try:
                     completed.append(processor.search_protected(self.search_query.query, params, store,
-                                                               self.start_time, self.actual_timeout))
+                                                               self.start_time, self.actual_timeout, observer=observer))
                 except Exception:  # no private exception text in machine evidence
                     completed.append(Refusal('storage_error'))
             thread = threading.Thread(target=copy_current_request_context(work), daemon=True)
-            thread.start()
-            thread.join(max(0, self.start_time + self.actual_timeout - default_timer()))
+            try:
+                thread.start()
+                thread.join(max(0, self.start_time + self.actual_timeout - default_timer()))
+            except BaseException:
+                observer.notify()
+                raise
+            finally:
+                with self._protection_lock:
+                    self._protection_observer = None
             if thread.is_alive():
-                # Observer never takes the worker flock or edits its rows. Late
-                # results stay in this worker's private list, not the container.
-                ref.update(status='unfinished', reason='unfinished_attempt', reservations=None,
-                           deadline_exceeded=True)
-                continue
-            outcome = completed[0]
+                # Only notify this dispatch. Its worker keeps the flock and DB,
+                # preserves NULL and commits poison at its next safe point.
+                outcome = observer.notify()
+                if outcome is None:
+                    ref.update(status='unfinished', reason='unfinished_attempt', reservations=None,
+                               deadline_exceeded=True)
+                    continue
+            else:
+                outcome = completed[0]
             if isinstance(outcome, Refusal):
                 ref['reason'] = outcome.reason
                 if outcome.reason == 'unfinished_attempt':

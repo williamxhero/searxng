@@ -188,6 +188,66 @@ def initialize_fixture(root, *, registry, clock):
         db.close()
 
 
+class DispatchNotification:
+    """One dispatch's cancellation notice; never contains a context, DB or FD."""
+
+    def __init__(self):
+        self._pid = os.getpid()
+        self._worker = None
+        self._lock = threading.Lock()
+        self._cancelled = threading.Event()
+        self._requested = threading.Event()
+        self._result = None
+
+    def _check_pid(self):
+        if os.getpid() != self._pid:
+            raise ProtectionError('capability_refused')
+
+    def _bind(self):
+        self._check_pid()
+        with self._lock:
+            if self._worker is not None:
+                raise ProtectionError('capability_refused')
+            self._worker = threading.get_ident()
+
+    @property
+    def cancelled(self):
+        self._check_pid()
+        return self._cancelled.is_set()
+
+    @property
+    def cancellation_requested(self):
+        self._check_pid()
+        return self._requested.is_set()
+
+    def cancel(self):
+        """Request stop, without claiming that the sender has stopped."""
+        self._check_pid()
+        with self._lock:
+            if self._result is None:
+                self._requested.set()
+
+    def notify(self):
+        self._check_pid()
+        # This mutex only arbitrates notification/publication. Neither side
+        # holds it during I/O or while waiting for the owning worker to stop.
+        with self._lock:
+            if self._result is None:
+                self._cancelled.set()
+            return self._result
+
+    def _publish(self, result, *, unfinished=False):
+        self._check_pid()
+        if self._worker != threading.get_ident():
+            raise ProtectionError('capability_refused')
+        with self._lock:
+            if not unfinished and (self.cancelled or (
+                    self.cancellation_requested and getattr(result, 'outcome', None) != 'cancelled')):
+                return False
+            self._result = result
+            return True
+
+
 class Store:
     """A validated handle, not a cached admission or a transferable lock."""
 
@@ -324,7 +384,14 @@ class Store:
         ).fetchone()[0] >= 30:
             raise ProtectionError('domestic_rate')
 
-    def run_engine(self, engine_name, *, caller, deadline_mono, build, send, parse):
+    def run_engine(self, engine_name, *, caller, deadline_mono, build, send, parse, observer=None):
+        if observer is not None:
+            if not isinstance(observer, DispatchNotification):
+                return Refusal('capability_refused')
+            try:
+                observer._bind()
+            except ProtectionError as error:
+                return Refusal(error.reason)
         if caller not in CALLERS or caller == 'legacy_probe':
             return Refusal('capability_refused')
         context = None
@@ -337,7 +404,7 @@ class Store:
                 entry = next(entry for entry in self.manifest['registry'] if entry['engine'] == canonical[0])
                 now = _clock()
                 self._admit(db, now, engine=entry, deadline=deadline_mono)
-                context = Dispatch(self, db, entry, caller, deadline_mono, now)
+                context = Dispatch(self, db, entry, caller, deadline_mono, now, observer)
                 context.reserve('engine_http')
                 token = CURRENT_DISPATCH.set(context)
                 outcome = 'request_refused'
@@ -372,10 +439,9 @@ class Store:
                     db.execute('INSERT INTO poison VALUES (?)', ('clock_error',))
                     _commit(db, self.root)
                     return Refusal('clock_error')
-                if context.unfinished:
-                    db.execute('INSERT INTO poison VALUES (?)', ('unfinished_attempt',))
-                    _commit(db, self.root)
-                    return Refusal('unfinished_attempt')
+                if context.unfinished or (observer is not None and (
+                        observer.cancelled or (observer.cancellation_requested and finished['mono'] >= deadline_mono))):
+                    return context.finish_unfinished()
                 db.execute('UPDATE attempts SET outcome=?,stamp=?,finished_mono=?,account_boot=?,account_mono=?,elapsed=? WHERE dispatch_id=?',
                            (outcome, finished['mono'], finished['mono'], finished['boot'], finished['mono'],
                             finished['mono'] - now['mono'], context.dispatch_id))
@@ -389,8 +455,13 @@ class Store:
                     db.execute('DELETE FROM pauses WHERE engine=?', (entry['engine'],))
                 db.execute('UPDATE state SET checkpoint=?', (canonical_json(finished),))
                 _commit(db, self.root)
-                return EngineOutcome(entry['engine'], outcome, len(context.rows), context.connections, context.headers,
-                                     result_count, finished['mono'] - now['mono'], finished['mono'] >= deadline_mono, results)
+                result = EngineOutcome(entry['engine'], outcome, len(context.rows), context.connections, context.headers,
+                                       result_count, finished['mono'] - now['mono'], finished['mono'] >= deadline_mono, results)
+                if observer is not None and not observer._publish(result):
+                    # Notification may arrive during the completion fsync. The
+                    # worker still owns the flock and must persist uncertainty.
+                    return context.finish_unfinished()
+                return result
         except ProtectionError as error:
             return Refusal(error.reason)
         except (OSError, sqlite3.Error):
@@ -539,7 +610,8 @@ class ReleaseReceipt:
 class Dispatch:
     """Internal, stack-scoped adapter context; never a reusable admission token."""
 
-    def __init__(self, store, db, entry, caller, deadline, started):
+    def __init__(self, store, db, entry, caller, deadline, started, observer=None):
+        self.observer = observer
         self.store = store
         self.db = db
         self.entry = entry
@@ -564,8 +636,25 @@ class Dispatch:
         if (not self.active or self.pid != os.getpid() or CURRENT_DISPATCH.get() is not self
                 or threading.get_ident() not in (self.owner_thread, self.async_thread)):
             raise ProtectionError('capability_refused')
-        if time.monotonic() >= self.deadline:
+        if (self.observer is not None and self.observer.cancelled) or time.monotonic() >= self.deadline:
+            if self.observer is not None:
+                self.unfinished = True
             raise ProtectionError('deadline_exceeded')
+        if self.observer is not None and self.observer.cancellation_requested:
+            raise EngineFailure('cancelled')
+
+    def finish_unfinished(self):
+        if threading.get_ident() != self.owner_thread or os.getpid() != self.pid:
+            raise ProtectionError('capability_refused')
+        self.unfinished = True
+        self.db.execute('UPDATE attempts SET outcome=NULL,finished_mono=NULL,elapsed=NULL WHERE dispatch_id=?',
+                        (self.dispatch_id,))
+        self.db.execute('INSERT INTO poison VALUES (?)', ('unfinished_attempt',))
+        _commit(self.db, self.store.root)
+        result = Refusal('unfinished_attempt')
+        if self.observer is not None:
+            self.observer._publish(result, unfinished=True)
+        return result
 
     def run_async(self, operation, loop):
         """Bind this one dispatch explicitly while the flock-owning thread waits."""
@@ -583,7 +672,6 @@ class Dispatch:
             finally:
                 self.async_thread = None
                 CURRENT_DISPATCH.reset(token)
-                stopped.set()
         future = concurrent.futures.Future()
         task = None
         def completed(done):
@@ -610,15 +698,25 @@ class Dispatch:
             else:
                 stopped.set()
         loop.call_soon_threadsafe(begin)
-        try:
-            return future.result(max(0, self.deadline - time.monotonic()))
-        except concurrent.futures.TimeoutError:
-            self.unfinished = True
-            loop.call_soon_threadsafe(cancel)
-            # A cancellation request is not proof its sender stopped. The task's
-            # completion callback also covers cancellation before its first step.
-            stopped.wait()
-            raise EngineFailure('timeout') from None
+        cancellation_sent = False
+        while True:
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0:
+                self.unfinished = True
+                if not cancellation_sent:
+                    loop.call_soon_threadsafe(cancel)
+                # Only the task completion callback proves stop. An uncooperative
+                # sender keeps the owning worker's flock until it actually exits.
+                stopped.wait()
+                raise EngineFailure('timeout') from None
+            if (self.observer is not None and (
+                    self.observer.cancellation_requested or self.observer.cancelled)) and not cancellation_sent:
+                loop.call_soon_threadsafe(cancel)
+                cancellation_sent = True
+            try:
+                return future.result(min(remaining, 0.02) if self.observer is not None else remaining)
+            except concurrent.futures.TimeoutError:
+                continue
 
     def reserve(self, phase):
         now = _clock()

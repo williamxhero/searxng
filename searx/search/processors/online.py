@@ -238,7 +238,7 @@ class OnlineProcessor(EngineProcessor):
         response.search_params = params
         return self.engine.response(response)
 
-    def search_protected(self, query, params, store, start_time, timeout_limit):
+    def search_protected(self, query, params, store, start_time, timeout_limit, observer=None):
         from wag_protection import EngineFailure  # pylint: disable=import-outside-toplevel
 
         self.init_network_in_thread(start_time, timeout_limit)
@@ -265,7 +265,7 @@ class OnlineProcessor(EngineProcessor):
         return store.run_engine(
             self.engine.name, caller='native_search', deadline_mono=start_time + min(timeout_limit, 3.0),
             build=build, send=lambda context, request_params: classified(lambda: self._send_http_request(request_params)),
-            parse=parse,
+            parse=parse, observer=observer,
         )
 
     def search(  # pyright: ignore[reportIncompatibleMethodOverride]

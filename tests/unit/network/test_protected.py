@@ -42,6 +42,9 @@ class CountedServer(ThreadingHTTPServer):
         self.headers = 0
         self.connect_headers = 0
         self.tunnel_port = None
+        self.request_entered = threading.Event()
+        self.body_release = threading.Event()
+        self.body_release.set()
 
     def get_request(self):
         connection = super().get_request()
@@ -54,6 +57,9 @@ class FixtureHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self.server.headers += 1
+        self.server.request_entered.set()
+        if not self.server.body_release.wait(10):
+            return
         host = self.headers.get('Host', '').split(':')[0]
         content = {'www.bing.com': BING_RESULT, 'www.chinaso.com': CHINASO_RESULT,
                    'yandex.com': YANDEX_RESULT}.get(host, QUARK_RESULT)
@@ -196,7 +202,7 @@ class ProtectedTransportTest(unittest.TestCase):
                                      build=lambda: params, send=lambda context, request_params: asyncio.run(request()),
                                      parse=engine.response)
 
-    def test_native_search_two_engines_same_query_complete_nonempty(self):
+    def native_search_fixture(self):
         from copy import deepcopy
         import sqlite3
         from flask import Flask
@@ -249,7 +255,13 @@ class ProtectedTransportTest(unittest.TestCase):
         searx.search.initialize(engine_settings, enable_metrics=False)
         query = SearchQuery('offline synthetic query', [EngineRef('quark', 'general'), EngineRef('bing', 'general')],
                             'en-US', 0, 1, None, 3.0)
-        search = searx.search.Search(query)
+        return searx.search.Search(query), root, manifest
+
+    def test_native_search_two_engines_same_query_complete_nonempty(self):
+        import sqlite3
+        from flask import Flask
+
+        search, root, manifest = self.native_search_fixture()
         with Flask('protected-native-test').test_request_context('/search'):
             container = search.search()
         summary = search.outbound_protection
@@ -273,6 +285,160 @@ class ProtectedTransportTest(unittest.TestCase):
             self.assertGreaterEqual(reserved, search.start_time)
             self.assertLessEqual(finished, search.start_time + 3.0)
             self.assertEqual((connections, headers), (1, 1))
+
+    def test_search_deadline_keeps_late_parser_null_and_poisoned_after_unlock(self):
+        import sqlite3
+        import sys
+        from flask import Flask
+        from searx.search.processors import PROCESSORS
+
+        search, root, manifest = self.native_search_fixture()
+        entered, release, parser_exited = threading.Event(), threading.Event(), threading.Event()
+        engine = PROCESSORS['bing'].engine
+        actual_parser = engine.response
+        def blocked_parser(response):
+            entered.set()
+            try:
+                if not release.wait(10):
+                    raise AssertionError('fixture release was not delivered')
+                return actual_parser(response)
+            finally:
+                parser_exited.set()
+        with patch.object(engine, 'response', blocked_parser):
+            try:
+                with Flask('late-parser-test').test_request_context('/search'):
+                    container = search.search()
+                self.assertTrue(entered.is_set())
+                self.assertEqual(search.actual_timeout, 3.0)
+                snapshot = json.loads(json.dumps(search.outbound_protection))
+                self.assertEqual(snapshot['status'], 'unfinished')
+                self.assertEqual(snapshot['engines'][1]['reason'], 'deadline_exceeded')
+                self.assertEqual(self.api.open_store(root, manifest=manifest, mode='synthetic').reason, 'lock_busy')
+                with sqlite3.connect(root / 'ledger.sqlite') as db:
+                    self.assertEqual(db.execute('SELECT engine,outcome FROM attempts').fetchall(), [('bing', None)])
+                self.assertEqual(self.tls_server.headers, 1)
+                self.assertEqual(len(container.get_ordered_results()), 0)
+            finally:
+                release.set()
+                self.assertTrue(parser_exited.wait(3), 'real parser did not stop after fixture release')
+            stop_deadline = time.monotonic() + 3
+            while time.monotonic() < stop_deadline:
+                reopened = self.api.open_store(root, manifest=manifest, mode='synthetic')
+                if getattr(reopened, 'reason', None) != 'lock_busy':
+                    break
+                parser_exited.wait(0.01)
+            self.assertNotEqual(getattr(reopened, 'reason', None), 'lock_busy')
+            with sqlite3.connect(root / 'ledger.sqlite') as db:
+                poison = [row[0] for row in db.execute('SELECT reason FROM poison')]
+                rows = db.execute('SELECT engine,outcome FROM attempts').fetchall()
+            script = '''
+import json, socket, sys
+from pathlib import Path
+def denied(*args, **kwargs):
+    raise AssertionError('child attempted network')
+socket.socket = denied
+import wag_protection
+manifest = json.loads(Path(sys.argv[2]).read_text())
+store = wag_protection.open_store(sys.argv[1], manifest=manifest, mode='synthetic')
+calls = []
+import time
+result = store.run_engine('quark', caller='probe', deadline_mono=time.monotonic()+3,
+    build=lambda: calls.append('build'), send=lambda context, request: calls.append('send'),
+    parse=lambda response: [])
+print(json.dumps({'reason': getattr(result, 'reason', None), 'calls': calls}))
+'''
+            child = subprocess.run([sys.executable, '-S', '-c', script, str(root),
+                                    str(Path(self.parent.name) / 'native-artifact.json')],
+                                   cwd=WORKSPACE, capture_output=True, text=True, check=False)
+            self.assertEqual(child.returncode, 0, child.stdout + child.stderr)
+            independent = json.loads(child.stdout)
+            self.assertEqual((poison, rows, independent),
+                             (['unfinished_attempt'], [('bing', None)],
+                              {'reason': 'unfinished_attempt', 'calls': []}))
+            self.assertEqual(search.outbound_protection, snapshot)
+            self.assertEqual(len(container.get_ordered_results()), 0)
+
+    def test_handler_cancel_confirms_real_async_stop_within_shared_deadline(self):
+        import sqlite3
+        from flask import Flask
+
+        search, root, manifest = self.native_search_fixture()
+        self.tls_server.body_release.clear()
+        cancelled, controller_errors = threading.Event(), []
+        def cancel_handler():
+            try:
+                if not self.tls_server.request_entered.wait(3):
+                    raise AssertionError('native request did not reach TLS fixture')
+                search.cancel()
+                cancelled.set()
+            except BaseException as error:
+                controller_errors.append(error)
+        controller = threading.Thread(target=cancel_handler, daemon=True)
+        controller.start()
+        try:
+            with Flask('handler-cancel-test').test_request_context('/search'):
+                container = search.search()
+        finally:
+            self.tls_server.body_release.set()
+            controller.join(3)
+        self.assertEqual(controller_errors, [])
+        self.assertTrue(cancelled.is_set())
+        self.assertLess(time.monotonic() - search.start_time, 3.0)
+        self.assertEqual(search.outbound_protection['engines'][0]['outcome'], 'cancelled')
+        self.assertEqual(self.tls_server.headers, 1)
+        self.assertEqual(len(container.get_ordered_results()), 0)
+        with sqlite3.connect(root / 'ledger.sqlite') as db:
+            self.assertEqual(db.execute('SELECT engine,outcome FROM attempts').fetchall(), [('bing', 'cancelled')])
+            self.assertEqual(db.execute('SELECT reason FROM poison').fetchall(), [])
+        reopened = self.api.open_store(root, manifest=manifest, mode='synthetic')
+        self.assertNotEqual(getattr(reopened, 'reason', None), 'lock_busy')
+
+    def test_real_async_unconfirmed_cancel_retains_lock_null_and_poison(self):
+        import httpx
+        import sqlite3
+        from searx.network.client import get_loop
+        from searx.network.protected import GuardedTransport
+
+        entered, cancel_seen, released, finished = (threading.Event() for _ in range(4))
+        release_async = asyncio.Event()
+        results = []
+        async def operation():
+            async with httpx.AsyncClient(transport=GuardedTransport(), trust_env=False) as client:
+                response = await client.get(f'http://127.0.0.1:{self.server.server_port}/')
+                entered.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    cancel_seen.set()
+                    await release_async.wait()
+                    released.set()
+                return response
+        def worker():
+            try:
+                results.append(self.store.run_engine('quark', caller='native_search',
+                    deadline_mono=time.monotonic()+3, build=lambda: None,
+                    send=lambda context, request: context.run_async(operation, get_loop()), parse=lambda response: []))
+            finally:
+                finished.set()
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(3))
+            self.assertTrue(cancel_seen.wait(3))
+            self.assertFalse(finished.is_set(), 'cancellation request was mistaken for stop confirmation')
+            self.assertEqual(self.api.open_store(self.root, manifest=self.manifest, mode='synthetic').reason, 'lock_busy')
+            with sqlite3.connect(self.root / 'ledger.sqlite') as db:
+                self.assertEqual(db.execute('SELECT outcome FROM attempts').fetchall(), [(None,)])
+        finally:
+            get_loop().call_soon_threadsafe(release_async.set)
+            self.assertTrue(finished.wait(3))
+            thread.join(0)
+        self.assertTrue(released.is_set())
+        self.assertEqual(results[0].reason, 'unfinished_attempt')
+        with sqlite3.connect(self.root / 'ledger.sqlite') as db:
+            self.assertEqual(db.execute('SELECT outcome FROM attempts').fetchall(), [(None,)])
+            self.assertEqual(db.execute('SELECT reason FROM poison').fetchall(), [('unfinished_attempt',)])
+        self.assertEqual((self.server.accepts, self.server.headers), (1, 1))
 
     def test_four_real_request_and_response_modules_direct_https_nonempty(self):
         trust = self.tls_fixture()
