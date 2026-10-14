@@ -545,6 +545,7 @@ os.close(fd)
         try:
             import select
 
+            assert process.stdout is not None
             self.assertTrue(select.select([process.stdout], [], [], 5)[0], 'lock owner did not start')
             self.assertEqual(process.stdout.readline().strip(), 'locked')
             result = self.api.migrate_legacy(root, manifest=manifest, authorization='synthetic:busy-lock')
@@ -623,6 +624,7 @@ print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
                 try:
                     import select
 
+                    assert process.stdout is not None
                     self.assertTrue(select.select([process.stdout], [], [], 5)[0], 'migration boundary was not reached')
                     observed = process.stdout.readline().strip()
                     if stage == 'deny':
@@ -1115,6 +1117,7 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
                     close_fds=True,
                 )
                 try:
+                    assert process.stdout is not None
                     self.assertTrue(select.select([process.stdout], [], [], 5)[0], 'real recovery sender did not seal')
                     self.assertEqual(process.stdout.readline().strip(), 'sealed')
                     before = (root / 'ledger.sqlite').read_bytes()
@@ -1123,6 +1126,7 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
                         old_attempts = [dict(row) for row in db.execute('SELECT * FROM attempts ORDER BY attempt_id')]
                         old_release = [tuple(row) for row in db.execute('SELECT * FROM release_checks')]
                         old_checkpoint = db.execute('SELECT checkpoint FROM state').fetchone()[0]
+                    assert process.stdin is not None
                     process.stdin.write('x')
                     process.stdin.flush()
                     self.assertTrue(
@@ -2063,6 +2067,7 @@ store.run_engine('bing', caller='probe', deadline_mono=103.0,
         try:
             import select
 
+            assert process.stdout is not None
             self.assertTrue(select.select([process.stdout], [], [], 5)[0], 'owner never entered build')
             child = int(process.stdout.readline())
             self.assertEqual(getattr(self.open(), 'reason', None), 'lock_busy')
