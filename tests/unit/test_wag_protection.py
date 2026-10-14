@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import socket
 import sqlite3
-import time
+from typing import TypedDict
 from unittest.mock import patch
 import subprocess
 import sys
@@ -16,6 +16,14 @@ import unittest
 
 
 WORKSPACE = Path(__file__).resolve().parents[2]
+
+
+class FixtureClock(TypedDict):
+    """Synthetic clock fields, including deliberately invalid numeric samples."""
+
+    wall: float
+    mono: float
+    boot: str
 
 
 def _reap_owned_fork(child):
@@ -60,7 +68,11 @@ assert not list(pathlib.Path(sys.argv[1]).iterdir())
             env = {**os.environ, 'PYTHONPATH': str(WORKSPACE), 'PYTHONDONTWRITEBYTECODE': '1'}
             child = subprocess.run(
                 [sys.executable, '-S', '-c', script, root],
-                cwd=root, env=env, capture_output=True, text=True, check=False,
+                cwd=root,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
             )
             self.assertEqual(child.returncode, 0, child.stdout + child.stderr)
 
@@ -100,17 +112,27 @@ def digest(value):
 def registry():
     return [
         {
-            'engine': name, 'domestic': domestic, 'module': module,
+            'engine': name,
+            'domestic': domestic,
+            'module': module,
             'capability': 'online_one_send',
             'source_digest': hashlib.sha256((WORKSPACE / f'searx/engines/{module}.py').read_bytes()).hexdigest(),
-            'aliases': [name], 'profile': {'live_hold': False, 'settings': {
-                'quark': {'quark_category': 'general'}, 'yandex': {'search_type': 'web'},
-                'chinaso news': {'chinaso_news_source': 'all'}, 'bing': {},
-            }[name]},
+            'aliases': [name],
+            'profile': {
+                'live_hold': False,
+                'settings': {
+                    'quark': {'quark_category': 'general'},
+                    'yandex': {'search_type': 'web'},
+                    'chinaso news': {'chinaso_news_source': 'all'},
+                    'bing': {},
+                }[name],
+            },
         }
         for name, domestic, module in [
-            ('bing', False, 'bing'), ('chinaso news', True, 'chinaso'),
-            ('quark', True, 'quark'), ('yandex', False, 'yandex'),
+            ('bing', False, 'bing'),
+            ('chinaso news', True, 'chinaso'),
+            ('quark', True, 'quark'),
+            ('yandex', False, 'yandex'),
         ]
     ]
 
@@ -123,39 +145,64 @@ def fixture_manifest(root, engines):
             *(WORKSPACE / f'searx/engines/{entry["module"]}.py' for entry in engines),
             WORKSPACE / 'searx/data/engine_traits.json',
             WORKSPACE / 'searx/engines/__init__.py',
-            WORKSPACE / 'searx/settings.yml', WORKSPACE / 'searx/settings_defaults.py',
-            WORKSPACE / 'searx/network/__init__.py', WORKSPACE / 'searx/network/client.py',
-            WORKSPACE / 'searx/network/network.py', WORKSPACE / 'searx/network/protected.py',
-            WORKSPACE / 'searx/search/__init__.py', WORKSPACE / 'searx/search/processors/abstract.py',
+            WORKSPACE / 'searx/settings.yml',
+            WORKSPACE / 'searx/settings_defaults.py',
+            WORKSPACE / 'searx/network/__init__.py',
+            WORKSPACE / 'searx/network/client.py',
+            WORKSPACE / 'searx/network/network.py',
+            WORKSPACE / 'searx/network/protected.py',
+            WORKSPACE / 'searx/search/__init__.py',
+            WORKSPACE / 'searx/search/processors/abstract.py',
             WORKSPACE / 'searx/search/processors/online.py',
         ]
     }
     python = Path(sys.executable).resolve()
     manifest = {
-        'schema': 'wag.protection-artifact.v2', 'contract': 'wag.outbound.v2', 'mode': 'synthetic',
+        'schema': 'wag.protection-artifact.v2',
+        'contract': 'wag.outbound.v2',
+        'mode': 'synthetic',
         'fork_commit': '9fea41204fdfa7a5cfa15b0ebd12904c520478ce',
-        'registry_digest': digest(engines), 'config_digest': 'a' * 64,
+        'registry_digest': digest(engines),
+        'config_digest': 'a' * 64,
         'python_digest': hashlib.sha256(python.read_bytes()).hexdigest(),
-        'module_root': str(WORKSPACE), 'python_executable': str(python), 'root': str(root),
-        'shared_gid': os.getgid(), 'allowed_uids': sorted({0, os.getuid()}),
-        'files': files, 'distributions': {}, 'wheels': {}, 'registry': engines,
+        'module_root': str(WORKSPACE),
+        'python_executable': str(python),
+        'root': str(root),
+        'shared_gid': os.getgid(),
+        'allowed_uids': sorted({0, os.getuid()}),
+        'files': files,
+        'distributions': {},
+        'wheels': {},
+        'registry': engines,
     }
-    manifest['artifact_digest'] = digest({key: manifest[key] for key in (
-        'contract', 'fork_commit', 'files', 'distributions', 'wheels', 'registry_digest', 'python_digest',
-    )})
+    manifest['artifact_digest'] = digest(
+        {
+            key: manifest[key]
+            for key in (
+                'contract',
+                'fork_commit',
+                'files',
+                'distributions',
+                'wheels',
+                'registry_digest',
+                'python_digest',
+            )
+        }
+    )
     return manifest
 
 
 class StoreTest(unittest.TestCase):
     def setUp(self):
         import wag_protection
+
         self.api = wag_protection
         self.parent = tempfile.TemporaryDirectory(dir=os.environ['TMPDIR'])
         self.addCleanup(self.parent.cleanup)
         self.root = Path(self.parent.name) / 'synthetic-state'
         self.engines = registry()
         self.boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
-        self.now = {'wall': 10000.0, 'mono': 100.0, 'boot': self.boot}
+        self.now: FixtureClock = {'wall': 10000.0, 'mono': 100.0, 'boot': self.boot}
         self.wall = patch('time.time', side_effect=lambda: self.now['wall'])
         self.mono = patch('time.monotonic', side_effect=lambda: self.now['mono'])
         self.wall.start()
@@ -172,8 +219,12 @@ class StoreTest(unittest.TestCase):
         root = Path(self.parent.name) / name
         root.mkdir(mode=0o700)
         identity = b'1' * 32  # Disposable synthetic token, never a copied live identity.
-        for path, data in [(root / 'identity', identity), (Path(str(root) + '.identity'), identity),
-                           (root / 'lock', b''), (root / 'ledger.sqlite', b'')]:
+        for path, data in [
+            (root / 'identity', identity),
+            (Path(str(root) + '.identity'), identity),
+            (root / 'lock', b''),
+            (root / 'ledger.sqlite', b''),
+        ]:
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, 'wb') as file:
                 file.write(data)
@@ -186,14 +237,19 @@ class StoreTest(unittest.TestCase):
             db.execute('CREATE TABLE pauses (engine TEXT PRIMARY KEY, strikes INTEGER, until REAL)')
             db.execute('CREATE TABLE poison (reason TEXT)')
             db.execute('INSERT INTO state VALUES (?,?,?)', (identity.decode(), str(root), checkpoint))
-            db.executemany('INSERT INTO attempts(rowid,engine,domestic,stamp,outcome) VALUES (?,?,?,?,?)', [
-                (7, 'chinaso news', 1, 8072913.0, 'ok'),
-                (19, 'chinaso news', 1, 8072914.25, 'ok'),
-                (41, 'quark', 1, 8072915.728828768, 'captcha'),
-            ])
+            db.executemany(
+                'INSERT INTO attempts(rowid,engine,domestic,stamp,outcome) VALUES (?,?,?,?,?)',
+                [
+                    (7, 'chinaso news', 1, 8072913.0, 'ok'),
+                    (19, 'chinaso news', 1, 8072914.25, 'ok'),
+                    (41, 'quark', 1, 8072915.728828768, 'captcha'),
+                ],
+            )
             if unfinished:
-                db.execute('INSERT INTO attempts(rowid,engine,domestic,stamp,outcome) VALUES (53,?,?,?,NULL)',
-                           ('bing', 0, 8072999.0))
+                db.execute(
+                    'INSERT INTO attempts(rowid,engine,domestic,stamp,outcome) VALUES (53,?,?,?,NULL)',
+                    ('bing', 0, 8072999.0),
+                )
             db.execute('INSERT INTO pauses VALUES (?,?,?)', ('quark', 1, 8074715.728828768))
             db.executemany('INSERT INTO poison(reason) VALUES (?)', [(reason,) for reason in poison])
         return root, fixture_manifest(root, self.engines), checkpoint
@@ -213,20 +269,76 @@ class StoreTest(unittest.TestCase):
             self.assertTrue(state[0].encode() == token)
             self.assertEqual(state[1:], (str(root), checkpoint))
             self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0], 2)
-            self.assertEqual(db.execute('SELECT registry_digest,migration_wall,migration_mono,migration_boot '
-                                        'FROM contract_meta').fetchone(),
-                             (manifest['registry_digest'], 10001.0, 8073001.0, self.boot))
-            rows = db.execute('SELECT attempt_id,dispatch_id,engine,domestic,stamp,outcome,reserved_mono,finished_mono,'
-                              'account_boot,account_mono,caller,phase,connection_attempted,http_attempted,elapsed,source '
-                              'FROM attempts ORDER BY attempt_id').fetchall()
-            self.assertEqual(rows, [
-                (7, 'legacy:7', 'chinaso news', 1, 8072913.0, 'ok', None, 8072913.0,
-                 self.boot, 8072913.0, 'legacy_probe', 'legacy', None, None, None, 'legacy'),
-                (19, 'legacy:19', 'chinaso news', 1, 8072914.25, 'ok', None, 8072914.25,
-                 self.boot, 8072914.25, 'legacy_probe', 'legacy', None, None, None, 'legacy'),
-                (41, 'legacy:41', 'quark', 1, 8072915.728828768, 'captcha', None, 8072915.728828768,
-                 self.boot, 8072915.728828768, 'legacy_probe', 'legacy', None, None, None, 'legacy'),
-            ])
+            self.assertEqual(
+                db.execute(
+                    'SELECT registry_digest,migration_wall,migration_mono,migration_boot ' 'FROM contract_meta'
+                ).fetchone(),
+                (manifest['registry_digest'], 10001.0, 8073001.0, self.boot),
+            )
+            rows = db.execute(
+                'SELECT attempt_id,dispatch_id,engine,domestic,stamp,outcome,reserved_mono,finished_mono,'
+                'account_boot,account_mono,caller,phase,connection_attempted,http_attempted,elapsed,source '
+                'FROM attempts ORDER BY attempt_id'
+            ).fetchall()
+            self.assertEqual(
+                rows,
+                [
+                    (
+                        7,
+                        'legacy:7',
+                        'chinaso news',
+                        1,
+                        8072913.0,
+                        'ok',
+                        None,
+                        8072913.0,
+                        self.boot,
+                        8072913.0,
+                        'legacy_probe',
+                        'legacy',
+                        None,
+                        None,
+                        None,
+                        'legacy',
+                    ),
+                    (
+                        19,
+                        'legacy:19',
+                        'chinaso news',
+                        1,
+                        8072914.25,
+                        'ok',
+                        None,
+                        8072914.25,
+                        self.boot,
+                        8072914.25,
+                        'legacy_probe',
+                        'legacy',
+                        None,
+                        None,
+                        None,
+                        'legacy',
+                    ),
+                    (
+                        41,
+                        'legacy:41',
+                        'quark',
+                        1,
+                        8072915.728828768,
+                        'captcha',
+                        None,
+                        8072915.728828768,
+                        self.boot,
+                        8072915.728828768,
+                        'legacy_probe',
+                        'legacy',
+                        None,
+                        None,
+                        None,
+                        'legacy',
+                    ),
+                ],
+            )
             self.assertEqual(db.execute('SELECT * FROM pauses').fetchall(), [('quark', 1, 8074715.728828768)])
         original_db = (root / 'ledger.sqlite').read_bytes()
         self.advance(17)
@@ -234,36 +346,58 @@ class StoreTest(unittest.TestCase):
         self.assertFalse(isinstance(repeated, self.api.Refusal))
         self.assertTrue((root / 'ledger.sqlite').read_bytes() == original_db, 'v2 repeat rewrote durable state')
         calls = []
-        outcome = repeated.run_engine('bing', caller='probe', deadline_mono=self.now['mono'] + 3,
-                                      build=lambda: calls.append('build'), send=lambda context, request: None,
-                                      parse=lambda response: [])
+        outcome = repeated.run_engine(
+            'bing',
+            caller='probe',
+            deadline_mono=self.now['mono'] + 3,
+            build=lambda: calls.append('build'),
+            send=lambda context, request: None,
+            parse=lambda response: [],
+        )
         self.assertEqual((outcome.outcome, calls), ('empty', ['build']))
-        refused = repeated.run_engine('quark', caller='probe', deadline_mono=self.now['mono'] + 3,
-                                      build=lambda: calls.append('quark'), send=lambda context, request: None,
-                                      parse=lambda response: [])
+        refused = repeated.run_engine(
+            'quark',
+            caller='probe',
+            deadline_mono=self.now['mono'] + 3,
+            build=lambda: calls.append('quark'),
+            send=lambda context, request: None,
+            parse=lambda response: [],
+        )
         self.assertEqual((refused.reason, calls), ('cooldown', ['build']))
 
     def test_migration_keeps_null_poison_order_and_old_clock_without_recovery(self):
         for number, poison in enumerate([(), ('clock_error', 'legacy_reason', 'clock_error')]):
             with self.subTest(poison=poison):
-                root, manifest, checkpoint = self.legacy_fixture(f'legacy-uncertain-{number}', unfinished=True,
-                                                                poison=poison)
+                root, manifest, checkpoint = self.legacy_fixture(
+                    f'legacy-uncertain-{number}', unfinished=True, poison=poison
+                )
                 with sqlite3.connect(root / 'ledger.sqlite') as db:
                     db.execute('UPDATE poison SET rowid=rowid+100')
                 migrated = self.api.migrate_legacy(root, manifest=manifest, authorization='synthetic:retain-unknown')
                 self.assertFalse(isinstance(migrated, self.api.Refusal))
                 with sqlite3.connect(root / 'ledger.sqlite') as db:
                     self.assertEqual(db.execute('SELECT checkpoint FROM state').fetchone()[0], checkpoint)
-                    self.assertEqual(db.execute('SELECT reason FROM poison ORDER BY rowid').fetchall(),
-                                     [(reason,) for reason in poison])
-                    self.assertEqual(db.execute('SELECT attempt_id,outcome,reserved_mono,finished_mono,account_boot,'
-                                                'account_mono,connection_attempted,http_attempted,elapsed '
-                                                'FROM attempts WHERE attempt_id=53').fetchone(),
-                                     (53, None, None, None, self.boot, 8072999.0, None, None, None))
+                    self.assertEqual(
+                        db.execute('SELECT reason FROM poison ORDER BY rowid').fetchall(),
+                        [(reason,) for reason in poison],
+                    )
+                    self.assertEqual(
+                        db.execute(
+                            'SELECT attempt_id,outcome,reserved_mono,finished_mono,account_boot,'
+                            'account_mono,connection_attempted,http_attempted,elapsed '
+                            'FROM attempts WHERE attempt_id=53'
+                        ).fetchone(),
+                        (53, None, None, None, self.boot, 8072999.0, None, None, None),
+                    )
                 calls = []
-                result = migrated.run_engine('bing', caller='probe', deadline_mono=self.now['mono'] + 3,
-                                             build=lambda: calls.append('build'), send=lambda context, request: None,
-                                             parse=lambda response: [])
+                result = migrated.run_engine(
+                    'bing',
+                    caller='probe',
+                    deadline_mono=self.now['mono'] + 3,
+                    build=lambda: calls.append('build'),
+                    send=lambda context, request: None,
+                    parse=lambda response: [],
+                )
                 self.assertEqual((result.reason, calls), ('clock_error' if poison else 'unfinished_attempt', []))
         root, manifest, checkpoint = self.legacy_fixture('legacy-old-boot')
         old = json.loads(checkpoint)
@@ -275,11 +409,18 @@ class StoreTest(unittest.TestCase):
         self.assertFalse(isinstance(migrated, self.api.Refusal))
         with sqlite3.connect(root / 'ledger.sqlite') as db:
             self.assertEqual(db.execute('SELECT checkpoint FROM state').fetchone()[0], checkpoint)
-            self.assertEqual(db.execute('SELECT DISTINCT account_boot FROM attempts').fetchall(), [('synthetic-old-boot',)])
+            self.assertEqual(
+                db.execute('SELECT DISTINCT account_boot FROM attempts').fetchall(), [('synthetic-old-boot',)]
+            )
         calls = []
-        result = migrated.run_engine('bing', caller='probe', deadline_mono=self.now['mono'] + 3,
-                                     build=lambda: calls.append('build'), send=lambda context, request: None,
-                                     parse=lambda response: [])
+        result = migrated.run_engine(
+            'bing',
+            caller='probe',
+            deadline_mono=self.now['mono'] + 3,
+            build=lambda: calls.append('build'),
+            send=lambda context, request: None,
+            parse=lambda response: [],
+        )
         self.assertEqual((result.reason, calls), ('clock_error', []))
 
     def test_migration_rejects_unknown_schema_version_and_illegal_legacy_rows(self):
@@ -324,8 +465,11 @@ class StoreTest(unittest.TestCase):
                 result = self.api.migrate_legacy(root, manifest=manifest, authorization=authorization)
                 self.assertEqual(getattr(result, 'reason', None), 'capability_refused')
                 self.assertTrue((root / 'ledger.sqlite').read_bytes() == before)
-        for invalid in [{**manifest, 'mode': 'production'}, {**manifest, 'extra': True},
-                        {**manifest, 'mode': 'unknown'}]:
+        for invalid in [
+            {**manifest, 'mode': 'production'},
+            {**manifest, 'extra': True},
+            {**manifest, 'mode': 'unknown'},
+        ]:
             result = self.api.migrate_legacy(root, manifest=invalid, authorization='synthetic:invalid-manifest')
             self.assertEqual(getattr(result, 'reason', None), 'provenance_error')
         manifest_path = Path(self.parent.name) / 'synthetic-migration-artifact.json'
@@ -386,10 +530,16 @@ print('locked', flush=True)
 os.read(0, 1)
 os.close(fd)
 '''
-        process = subprocess.Popen([sys.executable, '-S', '-c', script, str(root / 'lock')],
-                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        process = subprocess.Popen(
+            [sys.executable, '-S', '-c', script, str(root / 'lock')],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
         try:
             import select
+
             self.assertTrue(select.select([process.stdout], [], [], 5)[0], 'lock owner did not start')
             self.assertEqual(process.stdout.readline().strip(), 'locked')
             result = self.api.migrate_legacy(root, manifest=manifest, authorization='synthetic:busy-lock')
@@ -452,16 +602,22 @@ print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
 '''
         for stage in ('before', 'after', 'deny'):
             with self.subTest(stage=stage):
-                root, manifest, checkpoint = self.legacy_fixture(f'legacy-atomic-{stage}', unfinished=True,
-                                                                poison=('legacy_reason', 'clock_error', 'legacy_reason'))
+                root, manifest, checkpoint = self.legacy_fixture(
+                    f'legacy-atomic-{stage}', unfinished=True, poison=('legacy_reason', 'clock_error', 'legacy_reason')
+                )
                 token = (root / 'identity').read_bytes()
                 inode = (root / 'lock').stat().st_ino
                 process = subprocess.Popen(
                     [sys.executable, '-S', '-c', script, str(root), json.dumps(manifest), stage],
-                    cwd=WORKSPACE, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    cwd=WORKSPACE,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
                 )
                 try:
                     import select
+
                     self.assertTrue(select.select([process.stdout], [], [], 5)[0], 'migration boundary was not reached')
                     observed = process.stdout.readline().strip()
                     if stage == 'deny':
@@ -471,7 +627,9 @@ print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
                     else:
                         self.assertEqual(observed, stage)
                         # The true transaction is still held at this boundary.
-                        self.assertEqual(self.api.open_store(root, manifest=manifest, mode='synthetic').reason, 'lock_busy')
+                        self.assertEqual(
+                            self.api.open_store(root, manifest=manifest, mode='synthetic').reason, 'lock_busy'
+                        )
                         process.kill()
                         process.wait(timeout=5)
                     # A real reopen performs SQLite hot-journal recovery after
@@ -481,16 +639,26 @@ print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
                     with sqlite3.connect(root / 'ledger.sqlite') as db:
                         self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0], 2 if stage == 'after' else 0)
                         self.assertEqual(db.execute('SELECT checkpoint FROM state').fetchone()[0], checkpoint)
-                        self.assertEqual(db.execute('SELECT reason FROM poison ORDER BY rowid').fetchall(),
-                                         [('legacy_reason',), ('clock_error',), ('legacy_reason',)])
+                        self.assertEqual(
+                            db.execute('SELECT reason FROM poison ORDER BY rowid').fetchall(),
+                            [('legacy_reason',), ('clock_error',), ('legacy_reason',)],
+                        )
                         if stage == 'after':
-                            self.assertEqual(db.execute('SELECT attempt_id,outcome FROM attempts ORDER BY attempt_id').fetchall(),
-                                             [(7, 'ok'), (19, 'ok'), (41, 'captcha'), (53, None)])
+                            self.assertEqual(
+                                db.execute('SELECT attempt_id,outcome FROM attempts ORDER BY attempt_id').fetchall(),
+                                [(7, 'ok'), (19, 'ok'), (41, 'captcha'), (53, None)],
+                            )
                         else:
-                            self.assertEqual(db.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-                                             .fetchall(), [('attempts',), ('pauses',), ('poison',), ('state',)])
-                            self.assertEqual(db.execute('SELECT rowid,outcome FROM attempts ORDER BY rowid').fetchall(),
-                                             [(7, 'ok'), (19, 'ok'), (41, 'captcha'), (53, None)])
+                            self.assertEqual(
+                                db.execute(
+                                    "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+                                ).fetchall(),
+                                [('attempts',), ('pauses',), ('poison',), ('state',)],
+                            )
+                            self.assertEqual(
+                                db.execute('SELECT rowid,outcome FROM attempts ORDER BY rowid').fetchall(),
+                                [(7, 'ok'), (19, 'ok'), (41, 'captcha'), (53, None)],
+                            )
                     self.assertTrue((root / 'identity').read_bytes() == token)
                     self.assertTrue(Path(str(root) + '.identity').read_bytes() == token)
                     self.assertEqual((root / 'lock').stat().st_ino, inode)
@@ -506,21 +674,32 @@ print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
         store = self.open()
         store.claim_release('3' * 32, self.manifest['artifact_digest'], self.manifest['config_digest'], 110.0)
         authorization = 'synthetic:stage9-physical-stop'
-        with _SyntheticMaintenanceSession(self.root, manifest=self.manifest, authorization=authorization,
-                                          decision='combined') as session:
+        with _SyntheticMaintenanceSession(
+            self.root, manifest=self.manifest, authorization=authorization, decision='combined'
+        ) as session:
             sender = session.start_sender('quark')
             old_checkpoint = canonical({'wall': 9000.0, 'mono': 80.0, 'boot': 'synthetic-old-boot'}).decode()
             with sqlite3.connect(self.root / 'ledger.sqlite') as db:
                 db.row_factory = sqlite3.Row
                 db.execute('UPDATE state SET checkpoint=?', (old_checkpoint,))
-                db.executemany('INSERT INTO poison(rowid,reason) VALUES (?,?)', [
-                    (5, 'unfinished_attempt'), (8, 'clock_error'), (9, 'clock_error'), (11, 'legacy_reason'),
-                ])
+                db.executemany(
+                    'INSERT INTO poison(rowid,reason) VALUES (?,?)',
+                    [
+                        (5, 'unfinished_attempt'),
+                        (8, 'clock_error'),
+                        (9, 'clock_error'),
+                        (11, 'legacy_reason'),
+                    ],
+                )
                 db.executemany('INSERT INTO pauses VALUES (?,?,?)', [('quark', 1, 1900.0), ('yandex', 1, 800.0)])
                 old_attempts = [dict(row) for row in db.execute('SELECT * FROM attempts ORDER BY attempt_id')]
                 old_release = [tuple(row) for row in db.execute('SELECT * FROM release_checks')]
-            proof = session.seal(clear_poison=(self.api.PoisonSelection(5, 'unfinished_attempt'),
-                                              self.api.PoisonSelection(8, 'clock_error')))
+            proof = session.seal(
+                clear_poison=(
+                    self.api.PoisonSelection(5, 'unfinished_attempt'),
+                    self.api.PoisonSelection(8, 'clock_error'),
+                )
+            )
             before = (self.root / 'ledger.sqlite').read_bytes()
             refused = self.api.recover(self.root, authorization=authorization, decision='combined', proof=proof)
             self.assertEqual(refused.reason, 'evidence_unknown')
@@ -528,30 +707,57 @@ print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
             session.stop_sender(sender)
             result = self.api.recover(self.root, authorization=authorization, decision='combined', proof=proof)
             self.assertIs(type(result), self.api.RecoveryResult)
-            self.assertEqual((result.recovery_id, result.decision, result.terminated_count, result.reanchored_count),
-                             (1, 'combined', 1, 2))
+            self.assertEqual(
+                (result.recovery_id, result.decision, result.terminated_count, result.reanchored_count),
+                (1, 'combined', 1, 2),
+            )
             after = (self.root / 'ledger.sqlite').read_bytes()
-            self.assertEqual(self.api.recover(self.root, authorization=authorization,
-                                             decision='combined', proof=proof).reason, 'capability_refused')
+            self.assertEqual(
+                self.api.recover(self.root, authorization=authorization, decision='combined', proof=proof).reason,
+                'capability_refused',
+            )
             self.assertEqual((self.root / 'ledger.sqlite').read_bytes(), after)
         with sqlite3.connect(self.root / 'ledger.sqlite') as db:
-            self.assertEqual(db.execute('SELECT authorization,old_checkpoint,old_poison_json,new_boot,wall,mono,decision '
-                                        'FROM recoveries').fetchall(), [(authorization, old_checkpoint,
-                                        '["unfinished_attempt","clock_error","clock_error","legacy_reason"]',
-                                        self.boot, 10000.0, 100.0, 'combined')])
+            self.assertEqual(
+                db.execute(
+                    'SELECT authorization,old_checkpoint,old_poison_json,new_boot,wall,mono,decision ' 'FROM recoveries'
+                ).fetchall(),
+                [
+                    (
+                        authorization,
+                        old_checkpoint,
+                        '["unfinished_attempt","clock_error","clock_error","legacy_reason"]',
+                        self.boot,
+                        10000.0,
+                        100.0,
+                        'combined',
+                    )
+                ],
+            )
             audited = db.execute('SELECT attempt_id,old_row_json FROM recovery_attempts ORDER BY attempt_id').fetchall()
             self.assertEqual([json.loads(row[1]) for row in audited], old_attempts)
-            self.assertEqual(db.execute('SELECT engine,old_strikes,old_until FROM recovery_pauses ORDER BY engine').fetchall(),
-                             [('quark', 1, 1900.0), ('yandex', 1, 800.0)])
-            self.assertEqual(db.execute('SELECT engine,stamp,outcome,finished_mono,elapsed,connection_attempted,'
-                                        'http_attempted,account_boot,account_mono FROM attempts ORDER BY attempt_id').fetchall(), [
-                ('bing', 100.0, 'empty', 100.0, 0.0, 0, 0, self.boot, 100.0),
-                ('quark', 100.0, 'unknown_terminated', None, None, 0, 0, self.boot, 100.0),
-            ])
-            self.assertEqual(db.execute('SELECT * FROM pauses ORDER BY engine').fetchall(),
-                             [('quark', 2, 3700.0), ('yandex', 1, 1900.0)])
-            self.assertEqual(db.execute('SELECT rowid,reason FROM poison ORDER BY rowid').fetchall(),
-                             [(9, 'clock_error'), (11, 'legacy_reason')])
+            self.assertEqual(
+                db.execute('SELECT engine,old_strikes,old_until FROM recovery_pauses ORDER BY engine').fetchall(),
+                [('quark', 1, 1900.0), ('yandex', 1, 800.0)],
+            )
+            self.assertEqual(
+                db.execute(
+                    'SELECT engine,stamp,outcome,finished_mono,elapsed,connection_attempted,'
+                    'http_attempted,account_boot,account_mono FROM attempts ORDER BY attempt_id'
+                ).fetchall(),
+                [
+                    ('bing', 100.0, 'empty', 100.0, 0.0, 0, 0, self.boot, 100.0),
+                    ('quark', 100.0, 'unknown_terminated', None, None, 0, 0, self.boot, 100.0),
+                ],
+            )
+            self.assertEqual(
+                db.execute('SELECT * FROM pauses ORDER BY engine').fetchall(),
+                [('quark', 2, 3700.0), ('yandex', 1, 1900.0)],
+            )
+            self.assertEqual(
+                db.execute('SELECT rowid,reason FROM poison ORDER BY rowid').fetchall(),
+                [(9, 'clock_error'), (11, 'legacy_reason')],
+            )
             self.assertEqual(db.execute('SELECT * FROM release_checks').fetchall(), old_release)
         self.assertEqual(self.attempt('quark').reason, 'clock_error')
 
@@ -559,12 +765,17 @@ print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
         before = (self.root / 'ledger.sqlite').read_bytes()
         for proof in (True, {}, 'proof', None):
             with self.subTest(proof_type=type(proof).__name__):
-                result = self.api.recover(self.root, authorization='synthetic:invalid-proof',
-                                          decision='combined', proof=proof)
+                result = self.api.recover(
+                    self.root, authorization='synthetic:invalid-proof', decision='combined', proof=proof
+                )
                 self.assertEqual(result.reason, 'capability_refused')
                 self.assertEqual((self.root / 'ledger.sqlite').read_bytes(), before)
-        result = self.api.recover(Path('/var/lib/wag-route-probe'), authorization='production:looks-valid',
-                                  decision='combined', proof={'synthetic': True})
+        result = self.api.recover(
+            Path('/var/lib/wag-route-probe'),
+            authorization='production:looks-valid',
+            decision='combined',
+            proof={'synthetic': True},
+        )
         self.assertEqual(result.reason, 'evidence_unknown')
         self.assertEqual((self.root / 'ledger.sqlite').read_bytes(), before)
 
@@ -573,19 +784,26 @@ print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
         from wag_protection.ledger import _SyntheticMaintenanceSession
 
         authorization = 'synthetic:stage10-coverage'
-        with _SyntheticMaintenanceSession(self.root, manifest=self.manifest, authorization=authorization,
-                                          decision='combined') as session:
+        with _SyntheticMaintenanceSession(
+            self.root, manifest=self.manifest, authorization=authorization, decision='combined'
+        ) as session:
             binding = session.start_sender('bing')
             pidfd = os.pidfd_open(binding.pid, 0)
             self.addCleanup(os.close, pidfd)
             with self.assertRaises(TypeError):
-                self.api.MaintenanceCapability(authorization, 'combined', self.root, self.boot, 100.0, 200.0, (), session)
+                self.api.MaintenanceCapability(
+                    authorization, 'combined', self.root, self.boot, 100.0, 200.0, (), session
+                )
             proof = session.seal(clear_poison=())
             before = (self.root / 'ledger.sqlite').read_bytes()
-            self.assertEqual(self.api.recover(self.root, authorization=authorization,
-                                               decision='clock_reanchor', proof=proof).reason, 'capability_refused')
-            self.assertEqual(self.api.recover(self.root, authorization=authorization,
-                                               decision='combined', proof=proof).reason, 'evidence_unknown')
+            self.assertEqual(
+                self.api.recover(self.root, authorization=authorization, decision='clock_reanchor', proof=proof).reason,
+                'capability_refused',
+            )
+            self.assertEqual(
+                self.api.recover(self.root, authorization=authorization, decision='combined', proof=proof).reason,
+                'evidence_unknown',
+            )
             self.assertEqual((self.root / 'ledger.sqlite').read_bytes(), before)
             self.assertEqual(select.select([pidfd], [], [], 0)[0], [])
             session.stop_sender(binding)
@@ -601,8 +819,9 @@ print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
                 root = Path(self.parent.name) / f'missing-coverage-{timing}'
                 self.api.initialize_fixture(root, registry=self.engines, clock=lambda: dict(self.now))
                 manifest = fixture_manifest(root, self.engines)
-                with _SyntheticMaintenanceSession(root, manifest=manifest, authorization=authorization,
-                                                  decision='combined') as session:
+                with _SyntheticMaintenanceSession(
+                    root, manifest=manifest, authorization=authorization, decision='combined'
+                ) as session:
                     binding = session.start_sender('bing')
                     pidfd = os.pidfd_open(binding.pid, 0)
                     self.addCleanup(os.close, pidfd)
@@ -619,8 +838,9 @@ print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
                         ).lastrowid
                     self.assertNotIn(unregistered_id, binding.attempt_ids)
                     before = (root / 'ledger.sqlite').read_bytes()
-                    self.assertFalse(isinstance(self.api.open_store(root, manifest=manifest, mode='synthetic'),
-                                                self.api.Refusal))
+                    self.assertFalse(
+                        isinstance(self.api.open_store(root, manifest=manifest, mode='synthetic'), self.api.Refusal)
+                    )
                     for stopped in (False, True):
                         if stopped:
                             session.stop_sender(binding)
@@ -629,12 +849,18 @@ print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
                                 session.seal()
                             self.assertEqual(error.exception.reason, 'evidence_unknown')
                         else:
-                            self.assertEqual(self.api.recover(root, authorization=authorization,
-                                                               decision='combined', proof=proof).reason, 'evidence_unknown')
+                            self.assertEqual(
+                                self.api.recover(
+                                    root, authorization=authorization, decision='combined', proof=proof
+                                ).reason,
+                                'evidence_unknown',
+                            )
                         self.assertEqual((root / 'ledger.sqlite').read_bytes(), before)
                         self.assertEqual(select.select([pidfd], [], [], 0)[0], [pidfd] if stopped else [])
                         with sqlite3.connect(root / 'ledger.sqlite') as db:
-                            self.assertEqual(db.execute('SELECT count(*) FROM attempts WHERE outcome IS NULL').fetchone()[0], 2)
+                            self.assertEqual(
+                                db.execute('SELECT count(*) FROM attempts WHERE outcome IS NULL').fetchone()[0], 2
+                            )
                             for table in ('recoveries', 'recovery_attempts', 'recovery_pauses'):
                                 self.assertEqual(db.execute(f'SELECT count(*) FROM {table}').fetchone()[0], 0)
 
@@ -642,8 +868,9 @@ print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
         from wag_protection.ledger import _SyntheticMaintenanceSession
 
         authorization = 'synthetic:stage9-sql-fault'
-        with _SyntheticMaintenanceSession(self.root, manifest=self.manifest, authorization=authorization,
-                                          decision='combined') as session:
+        with _SyntheticMaintenanceSession(
+            self.root, manifest=self.manifest, authorization=authorization, decision='combined'
+        ) as session:
             binding = session.start_sender('quark')
             session.stop_sender(binding)
             proof = session.seal()
@@ -653,16 +880,24 @@ print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
             self.assertEqual(result.reason, 'storage_error')
             self.assertEqual((self.root / 'ledger.sqlite').read_bytes(), before)
             # Commit uncertainty consumes the proof; retry is refused rather than guessed.
-            self.assertEqual(self.api.recover(self.root, authorization=authorization,
-                                               decision='combined', proof=proof).reason, 'capability_refused')
+            self.assertEqual(
+                self.api.recover(self.root, authorization=authorization, decision='combined', proof=proof).reason,
+                'capability_refused',
+            )
 
     def recovery_fixture(self, name):
         root = Path(self.parent.name) / name
         self.api.initialize_fixture(root, registry=self.engines, clock=lambda: dict(self.now))
         manifest = fixture_manifest(root, self.engines)
         store = self.api.open_store(root, manifest=manifest, mode='synthetic')
-        outcome = store.run_engine('bing', caller='probe', deadline_mono=self.now['mono'] + 3,
-                                   build=lambda: None, send=lambda context, request: None, parse=lambda response: [])
+        outcome = store.run_engine(
+            'bing',
+            caller='probe',
+            deadline_mono=self.now['mono'] + 3,
+            build=lambda: None,
+            send=lambda context, request: None,
+            parse=lambda response: [],
+        )
         self.assertEqual(outcome.outcome, 'empty')
         store.claim_release('4' * 32, manifest['artifact_digest'], manifest['config_digest'], 110.0)
         return root, manifest
@@ -685,8 +920,9 @@ print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
             with self.subTest(table=table, column=column):
                 root, manifest = self.recovery_fixture(f'recovery-sql-fault-{number}')
                 authorization = f'synthetic:stage11-sql-{number}'
-                with _SyntheticMaintenanceSession(root, manifest=manifest, authorization=authorization,
-                                                  decision='combined') as session:
+                with _SyntheticMaintenanceSession(
+                    root, manifest=manifest, authorization=authorization, decision='combined'
+                ) as session:
                     binding = session.start_sender('quark')
                     session.stop_sender(binding)
                     checkpoint = canonical({'wall': 9000.0, 'mono': 80.0, 'boot': 'synthetic-old-boot'}).decode()
@@ -694,32 +930,59 @@ print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
                         db.row_factory = sqlite3.Row
                         db.execute('UPDATE state SET checkpoint=?', (checkpoint,))
                         db.execute('UPDATE attempts SET account_boot=?,account_mono=?', ('synthetic-old-boot', 90.0))
-                        db.execute('UPDATE attempts SET connection_attempted=NULL,http_attempted=NULL WHERE outcome IS NULL')
-                        db.executemany('INSERT INTO poison(rowid,reason) VALUES (?,?)', [
-                            (5, 'clock_error'), (8, 'unfinished_attempt'), (9, 'clock_error'), (11, 'legacy_reason'),
-                        ])
-                        db.executemany('INSERT INTO pauses VALUES (?,?,?)', [('quark', 1, 1900.0), ('yandex', 1, 800.0)])
+                        db.execute(
+                            'UPDATE attempts SET connection_attempted=NULL,http_attempted=NULL WHERE outcome IS NULL'
+                        )
+                        db.executemany(
+                            'INSERT INTO poison(rowid,reason) VALUES (?,?)',
+                            [
+                                (5, 'clock_error'),
+                                (8, 'unfinished_attempt'),
+                                (9, 'clock_error'),
+                                (11, 'legacy_reason'),
+                            ],
+                        )
+                        db.executemany(
+                            'INSERT INTO pauses VALUES (?,?,?)', [('quark', 1, 1900.0), ('yandex', 1, 800.0)]
+                        )
                         old_attempts = [dict(row) for row in db.execute('SELECT * FROM attempts ORDER BY attempt_id')]
                         old_release = [tuple(row) for row in db.execute('SELECT * FROM release_checks')]
-                    proof = session.seal(clear_poison=(self.api.PoisonSelection(5, 'clock_error'),
-                                                      self.api.PoisonSelection(8, 'unfinished_attempt')))
+                    proof = session.seal(
+                        clear_poison=(
+                            self.api.PoisonSelection(5, 'clock_error'),
+                            self.api.PoisonSelection(8, 'unfinished_attempt'),
+                        )
+                    )
                     before = (root / 'ledger.sqlite').read_bytes()
                     reached = []
 
                     def connect(database, *args, **kwargs):
                         db = original_connect(database, *args, **kwargs)
                         if str(database).startswith('file:' + str(root / 'ledger.sqlite')):
+
                             def authorize(operation, name, field, *unused):
                                 if (operation, name, field) == (action, table, column):
-                                    reached.append({
-                                        'counts': tuple(db.execute(f'SELECT count(*) FROM {audit}').fetchone()[0]
-                                                        for audit in ('recoveries', 'recovery_attempts', 'recovery_pauses')),
-                                        'audits': db.execute('SELECT old_row_json FROM recovery_attempts ORDER BY attempt_id').fetchall(),
-                                        'pauses': db.execute('SELECT engine,old_strikes,old_until FROM recovery_pauses ORDER BY engine').fetchall(),
-                                        'attempts': [dict(row) for row in db.execute('SELECT * FROM attempts ORDER BY attempt_id')],
-                                    })
+                                    reached.append(
+                                        {
+                                            'counts': tuple(
+                                                db.execute(f'SELECT count(*) FROM {audit}').fetchone()[0]
+                                                for audit in ('recoveries', 'recovery_attempts', 'recovery_pauses')
+                                            ),
+                                            'audits': db.execute(
+                                                'SELECT old_row_json FROM recovery_attempts ORDER BY attempt_id'
+                                            ).fetchall(),
+                                            'pauses': db.execute(
+                                                'SELECT engine,old_strikes,old_until FROM recovery_pauses ORDER BY engine'
+                                            ).fetchall(),
+                                            'attempts': [
+                                                dict(row)
+                                                for row in db.execute('SELECT * FROM attempts ORDER BY attempt_id')
+                                            ],
+                                        }
+                                    )
                                     return sqlite3.SQLITE_DENY
                                 return sqlite3.SQLITE_OK
+
                             db.set_authorizer(authorize)
                         return db
 
@@ -731,20 +994,31 @@ print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
                     if audit_counts[1] == 2:
                         self.assertEqual([json.loads(row[0]) for row in reached[0]['audits']], old_attempts)
                     if audit_counts[2] == 2:
-                        self.assertEqual([tuple(row) for row in reached[0]['pauses']], [('quark', 1, 1900.0), ('yandex', 1, 800.0)])
+                        self.assertEqual(
+                            [tuple(row) for row in reached[0]['pauses']], [('quark', 1, 1900.0), ('yandex', 1, 800.0)]
+                        )
                     if table == 'attempts' and column == 'outcome':
                         self.assertEqual([row['account_mono'] for row in reached[0]['attempts']], [100.0, 100.0])
                         self.assertIsNone(reached[0]['attempts'][1]['outcome'])
                     if table in ('pauses', 'state', 'poison'):
                         self.assertEqual(reached[0]['attempts'][1]['outcome'], 'unknown_terminated')
-                    self.assertTrue((root / 'ledger.sqlite').read_bytes() == before, 'SQL refusal changed durable ledger bytes')
+                    self.assertTrue(
+                        (root / 'ledger.sqlite').read_bytes() == before, 'SQL refusal changed durable ledger bytes'
+                    )
                     with original_connect(root / 'ledger.sqlite') as db:
                         db.row_factory = sqlite3.Row
-                        self.assertEqual([dict(row) for row in db.execute('SELECT * FROM attempts ORDER BY attempt_id')], old_attempts)
-                        self.assertEqual([tuple(row) for row in db.execute('SELECT * FROM release_checks')], old_release)
+                        self.assertEqual(
+                            [dict(row) for row in db.execute('SELECT * FROM attempts ORDER BY attempt_id')],
+                            old_attempts,
+                        )
+                        self.assertEqual(
+                            [tuple(row) for row in db.execute('SELECT * FROM release_checks')], old_release
+                        )
                         for audit in ('recoveries', 'recovery_attempts', 'recovery_pauses'):
                             self.assertEqual(db.execute(f'SELECT count(*) FROM {audit}').fetchone()[0], 0)
-                    self.assertFalse(isinstance(self.api.open_store(root, manifest=manifest, mode='synthetic'), self.api.Refusal))
+                    self.assertFalse(
+                        isinstance(self.api.open_store(root, manifest=manifest, mode='synthetic'), self.api.Refusal)
+                    )
 
     def test_recovery_real_commit_death_keeps_old_or_complete_new_state(self):
         import select
@@ -807,9 +1081,15 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
                 root, manifest = self.recovery_fixture(f'recovery-commit-death-{stage}')
                 identity = (root / 'identity').read_bytes()
                 lock_inode = (root / 'lock').stat().st_ino
-                process = subprocess.Popen([sys.executable, '-S', '-c', script, str(root), json.dumps(manifest), stage],
-                                           cwd=WORKSPACE, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                           text=True, close_fds=True)
+                process = subprocess.Popen(
+                    [sys.executable, '-S', '-c', script, str(root), json.dumps(manifest), stage],
+                    cwd=WORKSPACE,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    close_fds=True,
+                )
                 try:
                     self.assertTrue(select.select([process.stdout], [], [], 5)[0], 'real recovery sender did not seal')
                     self.assertEqual(process.stdout.readline().strip(), 'sealed')
@@ -821,47 +1101,88 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
                         old_checkpoint = db.execute('SELECT checkpoint FROM state').fetchone()[0]
                     process.stdin.write('x')
                     process.stdin.flush()
-                    self.assertTrue(select.select([process.stdout], [], [], 5)[0], 'real commit boundary was not reached')
+                    self.assertTrue(
+                        select.select([process.stdout], [], [], 5)[0], 'real commit boundary was not reached'
+                    )
                     self.assertEqual(process.stdout.readline().strip(), stage)
                     self.assertEqual(self.api.open_store(root, manifest=manifest, mode='synthetic').reason, 'lock_busy')
                     process.kill()
                     process.communicate(timeout=5)
                     self.assertEqual(process.returncode, -9)
                     # Reopen the actual database, including SQLite hot-journal rollback after precommit death.
-                    self.assertFalse(isinstance(self.api.open_store(root, manifest=manifest, mode='synthetic'), self.api.Refusal))
+                    self.assertFalse(
+                        isinstance(self.api.open_store(root, manifest=manifest, mode='synthetic'), self.api.Refusal)
+                    )
                     with sqlite3.connect(root / 'ledger.sqlite') as db:
                         db.row_factory = sqlite3.Row
                         attempts = [dict(row) for row in db.execute('SELECT * FROM attempts ORDER BY attempt_id')]
-                        self.assertEqual([tuple(row) for row in db.execute('SELECT * FROM release_checks')], old_release)
+                        self.assertEqual(
+                            [tuple(row) for row in db.execute('SELECT * FROM release_checks')], old_release
+                        )
                         if stage == 'before':
                             self.assertEqual(attempts, old_attempts)
                             self.assertEqual(db.execute('SELECT checkpoint FROM state').fetchone()[0], old_checkpoint)
                             for audit in ('recoveries', 'recovery_attempts', 'recovery_pauses'):
                                 self.assertEqual(db.execute(f'SELECT count(*) FROM {audit}').fetchone()[0], 0)
-                            self.assertEqual([tuple(row) for row in db.execute('SELECT * FROM pauses ORDER BY engine')],
-                                             [('quark', 1, 1900.0), ('yandex', 1, 800.0)])
-                            self.assertEqual([tuple(row) for row in db.execute('SELECT rowid,reason FROM poison ORDER BY rowid')],
-                                             [(5, 'clock_error'), (8, 'unfinished_attempt'), (9, 'clock_error'), (11, 'legacy_reason')])
+                            self.assertEqual(
+                                [tuple(row) for row in db.execute('SELECT * FROM pauses ORDER BY engine')],
+                                [('quark', 1, 1900.0), ('yandex', 1, 800.0)],
+                            )
+                            self.assertEqual(
+                                [tuple(row) for row in db.execute('SELECT rowid,reason FROM poison ORDER BY rowid')],
+                                [
+                                    (5, 'clock_error'),
+                                    (8, 'unfinished_attempt'),
+                                    (9, 'clock_error'),
+                                    (11, 'legacy_reason'),
+                                ],
+                            )
                         else:
                             expected = [dict(row, account_boot=self.boot, account_mono=100.0) for row in old_attempts]
                             expected[1]['outcome'] = 'unknown_terminated'
                             self.assertEqual(attempts, expected)
-                            self.assertEqual(db.execute('SELECT checkpoint FROM state').fetchone()[0], canonical(self.now).decode())
-                            self.assertEqual([tuple(row) for row in db.execute('SELECT * FROM recoveries')], [
-                                (1, 'synthetic:stage11-commit-death', old_checkpoint,
-                                 '["clock_error","unfinished_attempt","clock_error","legacy_reason"]', self.boot, 10000.0, 100.0, 'combined'),
-                            ])
-                            audited = db.execute('SELECT attempt_id,old_row_json FROM recovery_attempts ORDER BY attempt_id').fetchall()
-                            self.assertEqual([(row[0], json.loads(row[1])) for row in audited],
-                                             [(row['attempt_id'], row) for row in old_attempts])
-                            self.assertEqual([tuple(row) for row in db.execute('SELECT * FROM recovery_pauses ORDER BY engine')],
-                                             [(1, 'quark', 1, 1900.0), (1, 'yandex', 1, 800.0)])
-                            self.assertEqual([tuple(row) for row in db.execute('SELECT * FROM pauses ORDER BY engine')],
-                                             [('quark', 2, 3700.0), ('yandex', 1, 1900.0)])
-                            self.assertEqual([tuple(row) for row in db.execute('SELECT rowid,reason FROM poison ORDER BY rowid')],
-                                             [(9, 'clock_error'), (11, 'legacy_reason')])
+                            self.assertEqual(
+                                db.execute('SELECT checkpoint FROM state').fetchone()[0], canonical(self.now).decode()
+                            )
+                            self.assertEqual(
+                                [tuple(row) for row in db.execute('SELECT * FROM recoveries')],
+                                [
+                                    (
+                                        1,
+                                        'synthetic:stage11-commit-death',
+                                        old_checkpoint,
+                                        '["clock_error","unfinished_attempt","clock_error","legacy_reason"]',
+                                        self.boot,
+                                        10000.0,
+                                        100.0,
+                                        'combined',
+                                    ),
+                                ],
+                            )
+                            audited = db.execute(
+                                'SELECT attempt_id,old_row_json FROM recovery_attempts ORDER BY attempt_id'
+                            ).fetchall()
+                            self.assertEqual(
+                                [(row[0], json.loads(row[1])) for row in audited],
+                                [(row['attempt_id'], row) for row in old_attempts],
+                            )
+                            self.assertEqual(
+                                [tuple(row) for row in db.execute('SELECT * FROM recovery_pauses ORDER BY engine')],
+                                [(1, 'quark', 1, 1900.0), (1, 'yandex', 1, 800.0)],
+                            )
+                            self.assertEqual(
+                                [tuple(row) for row in db.execute('SELECT * FROM pauses ORDER BY engine')],
+                                [('quark', 2, 3700.0), ('yandex', 1, 1900.0)],
+                            )
+                            self.assertEqual(
+                                [tuple(row) for row in db.execute('SELECT rowid,reason FROM poison ORDER BY rowid')],
+                                [(9, 'clock_error'), (11, 'legacy_reason')],
+                            )
                     if stage == 'before':
-                        self.assertTrue((root / 'ledger.sqlite').read_bytes() == before, 'precommit death changed durable ledger bytes')
+                        self.assertTrue(
+                            (root / 'ledger.sqlite').read_bytes() == before,
+                            'precommit death changed durable ledger bytes',
+                        )
                     self.assertTrue((root / 'identity').read_bytes() == identity)
                     self.assertTrue(Path(str(root) + '.identity').read_bytes() == identity)
                     self.assertEqual((root / 'lock').stat().st_ino, lock_inode)
@@ -875,8 +1196,9 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
 
         root, manifest = self.recovery_fixture('recovery-fsync-uncertain')
         authorization = 'synthetic:stage11-fsync-uncertain'
-        with _SyntheticMaintenanceSession(root, manifest=manifest, authorization=authorization,
-                                          decision='combined') as session:
+        with _SyntheticMaintenanceSession(
+            root, manifest=manifest, authorization=authorization, decision='combined'
+        ) as session:
             binding = session.start_sender('quark')
             session.stop_sender(binding)
             with sqlite3.connect(root / 'ledger.sqlite') as db:
@@ -892,8 +1214,10 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
                 self.assertEqual(os.fstat(fd).st_ino, root.stat().st_ino)
                 with sqlite3.connect(root / 'ledger.sqlite') as db:
                     observed.append(db.execute('SELECT count(*) FROM recoveries').fetchone()[0])
-                    self.assertEqual(db.execute('SELECT outcome FROM attempts WHERE engine=?', ('quark',)).fetchone()[0],
-                                     'unknown_terminated')
+                    self.assertEqual(
+                        db.execute('SELECT outcome FROM attempts WHERE engine=?', ('quark',)).fetchone()[0],
+                        'unknown_terminated',
+                    )
                 raise OSError('synthetic postcommit directory fsync fault')
 
             with patch('os.fsync', side_effect=fail_directory_fsync):
@@ -905,16 +1229,28 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
             with sqlite3.connect(root / 'ledger.sqlite') as db:
                 audited = db.execute('SELECT old_row_json FROM recovery_attempts ORDER BY attempt_id').fetchall()
                 self.assertEqual([json.loads(row[0]) for row in audited], old_attempts)
-                self.assertEqual(db.execute('SELECT engine,old_strikes,old_until FROM recovery_pauses').fetchall(),
-                                 [('quark', None, None)])
+                self.assertEqual(
+                    db.execute('SELECT engine,old_strikes,old_until FROM recovery_pauses').fetchall(),
+                    [('quark', None, None)],
+                )
                 self.assertEqual(db.execute('SELECT * FROM pauses').fetchall(), [('quark', 1, 1900.0)])
-                self.assertEqual(db.execute('SELECT finished_mono,elapsed,connection_attempted,http_attempted FROM attempts '
-                                            'WHERE engine=?', ('quark',)).fetchone(), (None, None, None, None))
+                self.assertEqual(
+                    db.execute(
+                        'SELECT finished_mono,elapsed,connection_attempted,http_attempted FROM attempts '
+                        'WHERE engine=?',
+                        ('quark',),
+                    ).fetchone(),
+                    (None, None, None, None),
+                )
                 self.assertEqual(db.execute('SELECT * FROM release_checks').fetchall(), old_release)
-            self.assertEqual(self.api.recover(root, authorization=authorization,
-                                               decision='combined', proof=proof).reason, 'capability_refused')
+            self.assertEqual(
+                self.api.recover(root, authorization=authorization, decision='combined', proof=proof).reason,
+                'capability_refused',
+            )
             self.assertTrue((root / 'ledger.sqlite').read_bytes() == after, 'uncertain recovery was retried')
-            self.assertFalse(isinstance(self.api.open_store(root, manifest=manifest, mode='synthetic'), self.api.Refusal))
+            self.assertFalse(
+                isinstance(self.api.open_store(root, manifest=manifest, mode='synthetic'), self.api.Refusal)
+            )
 
     def test_recovery_owner_thread_fork_and_counterfeit_proofs_refuse_without_callbacks(self):
         import pickle
@@ -924,15 +1260,19 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
 
         root, manifest = self.recovery_fixture('recovery-owner-proof')
         authorization = 'synthetic:stage11-owner-proof'
-        with _SyntheticMaintenanceSession(root, manifest=manifest, authorization=authorization,
-                                          decision='combined') as session:
+        with _SyntheticMaintenanceSession(
+            root, manifest=manifest, authorization=authorization, decision='combined'
+        ) as session:
             binding = session.start_sender('quark')
             session.stop_sender(binding)
             proof = session.seal()
             before = (root / 'ledger.sqlite').read_bytes()
             replies = []
-            thread = threading.Thread(target=lambda: replies.append(self.api.recover(
-                root, authorization=authorization, decision='combined', proof=proof)))
+            thread = threading.Thread(
+                target=lambda: replies.append(
+                    self.api.recover(root, authorization=authorization, decision='combined', proof=proof)
+                )
+            )
             thread.start()
             thread.join(timeout=5)
             self.assertFalse(thread.is_alive(), 'cross-owner refusal did not finish')
@@ -972,8 +1312,9 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
                     called.append(name)
                     raise AssertionError('untyped proof callback executed')
 
-            copied = self.api.RecoveryProofV1(proof.version, proof.capability, proof.approved_manifest,
-                                             proof.sender_bindings, proof._witness)
+            copied = self.api.RecoveryProofV1(
+                proof.version, proof.capability, proof.approved_manifest, proof.sender_bindings, proof._witness
+            )
             for value in (copied, object.__new__(Counterfeit), Callback(), b'serialized-proof', True, {}):
                 result = self.api.recover(root, authorization=authorization, decision='combined', proof=value)
                 self.assertEqual(result.reason, 'capability_refused')
@@ -987,16 +1328,19 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
 
         root, manifest = self.recovery_fixture('recovery-expiry-boot')
         authorization = 'synthetic:stage11-expiry-boot'
-        with _SyntheticMaintenanceSession(root, manifest=manifest, authorization=authorization,
-                                          decision='combined') as session:
+        with _SyntheticMaintenanceSession(
+            root, manifest=manifest, authorization=authorization, decision='combined'
+        ) as session:
             binding = session.start_sender('quark')
             session.stop_sender(binding)
             proof = session.seal()
             before = (root / 'ledger.sqlite').read_bytes()
             clock = dict(self.now)
             self.advance(300)
-            self.assertEqual(self.api.recover(root, authorization=authorization,
-                                               decision='combined', proof=proof).reason, 'evidence_unknown')
+            self.assertEqual(
+                self.api.recover(root, authorization=authorization, decision='combined', proof=proof).reason,
+                'evidence_unknown',
+            )
             self.assertTrue((root / 'ledger.sqlite').read_bytes() == before)
             self.now.update(clock)
             original_read = Path.read_text
@@ -1007,8 +1351,10 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
                 return original_read(path, *args, **kwargs)
 
             with patch.object(Path, 'read_text', changed_boot):
-                self.assertEqual(self.api.recover(root, authorization=authorization,
-                                                   decision='combined', proof=proof).reason, 'evidence_unknown')
+                self.assertEqual(
+                    self.api.recover(root, authorization=authorization, decision='combined', proof=proof).reason,
+                    'evidence_unknown',
+                )
             self.assertTrue((root / 'ledger.sqlite').read_bytes() == before)
             result = self.api.recover(root, authorization=authorization, decision='combined', proof=proof)
             self.assertIs(type(result), self.api.RecoveryResult)
@@ -1020,8 +1366,9 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
             with self.subTest(binding=target):
                 root, manifest = self.recovery_fixture(f'recovery-replaced-{target}')
                 authorization = f'synthetic:stage11-binding-{target}'
-                with _SyntheticMaintenanceSession(root, manifest=manifest, authorization=authorization,
-                                                  decision='combined') as session:
+                with _SyntheticMaintenanceSession(
+                    root, manifest=manifest, authorization=authorization, decision='combined'
+                ) as session:
                     binding = session.start_sender('quark')
                     session.stop_sender(binding)
                     proof = session.seal()
@@ -1036,8 +1383,12 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
                     elif target == 'identity_content':
                         (root / 'identity').write_bytes(b'5' * 32)
                     else:
-                        path = {'lock': root / 'lock', 'identity': root / 'identity',
-                                'anchor': Path(str(root) + '.identity'), 'ledger': root / 'ledger.sqlite'}[target]
+                        path = {
+                            'lock': root / 'lock',
+                            'identity': root / 'identity',
+                            'anchor': Path(str(root) + '.identity'),
+                            'ledger': root / 'ledger.sqlite',
+                        }[target]
                         original_inode = path.stat().st_ino
                         replacement = path.with_name(path.name + '-replacement')
                         with os.fdopen(os.open(replacement, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as file:
@@ -1047,21 +1398,28 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
                     before = (root / 'ledger.sqlite').read_bytes()
                     result = self.api.recover(root, authorization=authorization, decision='combined', proof=proof)
                     self.assertEqual(result.reason, 'identity_error')
-                    self.assertTrue((root / 'ledger.sqlite').read_bytes() == before, 'binding refusal changed durable ledger bytes')
+                    self.assertTrue(
+                        (root / 'ledger.sqlite').read_bytes() == before, 'binding refusal changed durable ledger bytes'
+                    )
                     with sqlite3.connect(root / 'ledger.sqlite') as db:
-                        self.assertEqual(db.execute('SELECT count(*) FROM attempts WHERE outcome IS NULL').fetchone()[0], 1)
+                        self.assertEqual(
+                            db.execute('SELECT count(*) FROM attempts WHERE outcome IS NULL').fetchone()[0], 1
+                        )
                         for audit in ('recoveries', 'recovery_attempts', 'recovery_pauses'):
                             self.assertEqual(db.execute(f'SELECT count(*) FROM {audit}').fetchone()[0], 0)
                     if target != 'identity_content':
-                        self.assertFalse(isinstance(self.api.open_store(root, manifest=manifest, mode='synthetic'), self.api.Refusal))
+                        self.assertFalse(
+                            isinstance(self.api.open_store(root, manifest=manifest, mode='synthetic'), self.api.Refusal)
+                        )
 
     def test_recovery_manifest_is_deep_frozen_and_proof_replacement_refuses(self):
         from wag_protection.ledger import _SyntheticMaintenanceSession
 
         root, manifest = self.recovery_fixture('recovery-manifest-binding')
         authorization = 'synthetic:stage11-manifest-binding'
-        with _SyntheticMaintenanceSession(root, manifest=manifest, authorization=authorization,
-                                          decision='combined') as session:
+        with _SyntheticMaintenanceSession(
+            root, manifest=manifest, authorization=authorization, decision='combined'
+        ) as session:
             binding = session.start_sender('quark')
             session.stop_sender(binding)
             proof = session.seal()
@@ -1084,13 +1442,18 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
     def test_recovery_decisions_enforce_null_and_clock_requirements(self):
         from wag_protection.ledger import _SyntheticMaintenanceSession
 
-        for decision, invalid in (('clock_reanchor', False), ('clock_reanchor', True),
-                                  ('terminated_sender', False), ('terminated_sender', True)):
+        for decision, invalid in (
+            ('clock_reanchor', False),
+            ('clock_reanchor', True),
+            ('terminated_sender', False),
+            ('terminated_sender', True),
+        ):
             with self.subTest(decision=decision, invalid=invalid):
                 root, manifest = self.recovery_fixture(f'recovery-decision-{decision}-{invalid}')
                 authorization = f'synthetic:stage11-decision-{decision}-{invalid}'
-                with _SyntheticMaintenanceSession(root, manifest=manifest, authorization=authorization,
-                                                  decision=decision) as session:
+                with _SyntheticMaintenanceSession(
+                    root, manifest=manifest, authorization=authorization, decision=decision
+                ) as session:
                     binding = session.start_sender('quark' if decision == 'terminated_sender' or invalid else None)
                     session.stop_sender(binding)
                     with sqlite3.connect(root / 'ledger.sqlite') as db:
@@ -1098,53 +1461,75 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
                         if decision == 'clock_reanchor':
                             checkpoint = dict(self.now, wall=9000.0, mono=80.0, boot='synthetic-old-boot')
                             db.execute('UPDATE state SET checkpoint=?', (canonical(checkpoint).decode(),))
-                            db.execute('UPDATE attempts SET account_boot=?,account_mono=?', ('synthetic-old-boot', 90.0))
+                            db.execute(
+                                'UPDATE attempts SET account_boot=?,account_mono=?', ('synthetic-old-boot', 90.0)
+                            )
                             db.execute('INSERT INTO poison(rowid,reason) VALUES (5,?)', ('clock_error',))
                         elif invalid:
-                            db.execute('UPDATE state SET checkpoint=?', (canonical(dict(self.now, wall=9000.0)).decode(),))
+                            db.execute(
+                                'UPDATE state SET checkpoint=?', (canonical(dict(self.now, wall=9000.0)).decode(),)
+                            )
                         old_attempts = [dict(row) for row in db.execute('SELECT * FROM attempts ORDER BY attempt_id')]
                     selection = (self.api.PoisonSelection(5, 'clock_error'),) if decision == 'clock_reanchor' else ()
                     proof = session.seal(clear_poison=selection)
                     before = (root / 'ledger.sqlite').read_bytes()
                     result = self.api.recover(root, authorization=authorization, decision=decision, proof=proof)
                     if invalid:
-                        self.assertEqual(result.reason, 'evidence_unknown' if decision == 'clock_reanchor' else 'clock_error')
+                        self.assertEqual(
+                            result.reason, 'evidence_unknown' if decision == 'clock_reanchor' else 'clock_error'
+                        )
                         self.assertTrue((root / 'ledger.sqlite').read_bytes() == before)
                         with sqlite3.connect(root / 'ledger.sqlite') as db:
                             for audit in ('recoveries', 'recovery_attempts', 'recovery_pauses'):
                                 self.assertEqual(db.execute(f'SELECT count(*) FROM {audit}').fetchone()[0], 0)
                     else:
                         self.assertIs(type(result), self.api.RecoveryResult)
-                        self.assertEqual((result.terminated_count, result.reanchored_count),
-                                         (0, 1) if decision == 'clock_reanchor' else (1, 0))
+                        self.assertEqual(
+                            (result.terminated_count, result.reanchored_count),
+                            (0, 1) if decision == 'clock_reanchor' else (1, 0),
+                        )
                         with sqlite3.connect(root / 'ledger.sqlite') as db:
                             db.row_factory = sqlite3.Row
                             changed = old_attempts if decision == 'clock_reanchor' else old_attempts[1:]
-                            audited = db.execute('SELECT attempt_id,old_row_json FROM recovery_attempts ORDER BY attempt_id').fetchall()
-                            self.assertEqual([(row[0], json.loads(row[1])) for row in audited],
-                                             [(row['attempt_id'], row) for row in changed])
+                            audited = db.execute(
+                                'SELECT attempt_id,old_row_json FROM recovery_attempts ORDER BY attempt_id'
+                            ).fetchall()
+                            self.assertEqual(
+                                [(row[0], json.loads(row[1])) for row in audited],
+                                [(row['attempt_id'], row) for row in changed],
+                            )
                             bing = dict(db.execute('SELECT * FROM attempts WHERE engine=?', ('bing',)).fetchone())
-                            expected_bing = (dict(old_attempts[0], account_boot=self.boot, account_mono=100.0)
-                                             if decision == 'clock_reanchor' else old_attempts[0])
+                            expected_bing = (
+                                dict(old_attempts[0], account_boot=self.boot, account_mono=100.0)
+                                if decision == 'clock_reanchor'
+                                else old_attempts[0]
+                            )
                             self.assertEqual(bing, expected_bing)
                             if decision == 'clock_reanchor':
                                 self.assertEqual(db.execute('SELECT count(*) FROM poison').fetchone()[0], 0)
                                 self.assertEqual(db.execute('SELECT count(*) FROM pauses').fetchone()[0], 0)
                             else:
-                                self.assertEqual(db.execute('SELECT outcome FROM attempts WHERE engine=?', ('quark',)).fetchone()[0],
-                                                 'unknown_terminated')
-                                self.assertEqual([tuple(row) for row in db.execute('SELECT * FROM pauses')], [('quark', 1, 1900.0)])
+                                self.assertEqual(
+                                    db.execute('SELECT outcome FROM attempts WHERE engine=?', ('quark',)).fetchone()[0],
+                                    'unknown_terminated',
+                                )
+                                self.assertEqual(
+                                    [tuple(row) for row in db.execute('SELECT * FROM pauses')], [('quark', 1, 1900.0)]
+                                )
 
     def test_recovery_unknown_legacy_null_cannot_be_claimed_by_empty_sender_binding(self):
         import select
         from wag_protection.ledger import _SyntheticMaintenanceSession
 
-        root, manifest, _ = self.legacy_fixture('recovery-unknown-legacy', unfinished=True, poison=('unfinished_attempt',))
+        root, manifest, _ = self.legacy_fixture(
+            'recovery-unknown-legacy', unfinished=True, poison=('unfinished_attempt',)
+        )
         migrated = self.api.migrate_legacy(root, manifest=manifest, authorization='synthetic:stage11-legacy-migration')
         self.assertFalse(isinstance(migrated, self.api.Refusal))
         authorization = 'synthetic:stage11-legacy-unknown'
-        with _SyntheticMaintenanceSession(root, manifest=manifest, authorization=authorization,
-                                          decision='combined') as session:
+        with _SyntheticMaintenanceSession(
+            root, manifest=manifest, authorization=authorization, decision='combined'
+        ) as session:
             binding = session.start_sender()
             self.assertEqual(binding.attempt_ids, ())
             pidfd = os.pidfd_open(binding.pid, 0)
@@ -1159,8 +1544,10 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
                 self.assertTrue((root / 'ledger.sqlite').read_bytes() == before)
                 self.assertEqual(select.select([pidfd], [], [], 0)[0], [pidfd] if stopped else [])
                 with sqlite3.connect(root / 'ledger.sqlite') as db:
-                    self.assertEqual(db.execute('SELECT attempt_id,outcome,source FROM attempts WHERE outcome IS NULL').fetchall(),
-                                     [(53, None, 'legacy')])
+                    self.assertEqual(
+                        db.execute('SELECT attempt_id,outcome,source FROM attempts WHERE outcome IS NULL').fetchall(),
+                        [(53, None, 'legacy')],
+                    )
                     for audit in ('recoveries', 'recovery_attempts', 'recovery_pauses'):
                         self.assertEqual(db.execute(f'SELECT count(*) FROM {audit}').fetchone()[0], 0)
 
@@ -1169,17 +1556,20 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
 
         root, manifest = self.recovery_fixture('recovery-production-proof-refusal')
         authorization = 'synthetic:stage11-production-refusal'
-        with _SyntheticMaintenanceSession(root, manifest=manifest, authorization=authorization,
-                                          decision='combined') as session:
+        with _SyntheticMaintenanceSession(
+            root, manifest=manifest, authorization=authorization, decision='combined'
+        ) as session:
             binding = session.start_sender('quark')
             session.stop_sender(binding)
             proof = session.seal()
             before = (root / 'ledger.sqlite').read_bytes()
-            with patch('sqlite3.connect', side_effect=AssertionError('production proof opened SQLite')), \
-                 patch('subprocess.Popen', side_effect=AssertionError('production proof started a process')), \
-                 patch.object(Path, 'read_bytes', side_effect=AssertionError('production proof read file contents')), \
-                 patch.object(Path, 'write_bytes', side_effect=AssertionError('production proof wrote a file')), \
-                 patch.object(Path, 'write_text', side_effect=AssertionError('production proof wrote a file')):
+            with (
+                patch('sqlite3.connect', side_effect=AssertionError('production proof opened SQLite')),
+                patch('subprocess.Popen', side_effect=AssertionError('production proof started a process')),
+                patch.object(Path, 'read_bytes', side_effect=AssertionError('production proof read file contents')),
+                patch.object(Path, 'write_bytes', side_effect=AssertionError('production proof wrote a file')),
+                patch.object(Path, 'write_text', side_effect=AssertionError('production proof wrote a file')),
+            ):
                 for target in (Path('/var/lib/wag-route-probe'), Path('/var/lib/wag-route-probe/unapproved-child')):
                     result = self.api.recover(target, authorization=authorization, decision='combined', proof=proof)
                     self.assertEqual(result.reason, 'evidence_unknown')
@@ -1189,9 +1579,13 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
 
     def test_malformed_recovery_audit_refuses_before_callbacks(self):
         mutations = [
-            ('wall', -1.0), ('mono', float('inf')), ('decision', 'reset_budget'),
-            ('new_boot', ''), ('old_checkpoint', '{"mono":100}'),
-            ('old_poison_json', '{}'), ('old_poison_json', '[null]'),
+            ('wall', -1.0),
+            ('mono', float('inf')),
+            ('decision', 'reset_budget'),
+            ('new_boot', ''),
+            ('old_checkpoint', '{"mono":100}'),
+            ('old_poison_json', '{}'),
+            ('old_poison_json', '[null]'),
         ]
         for number, (field, value) in enumerate(mutations):
             with self.subTest(field=field, value=value):
@@ -1200,32 +1594,56 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
                 manifest = fixture_manifest(root, self.engines)
                 store = self.api.open_store(root, manifest=manifest, mode='synthetic')
                 with sqlite3.connect(root / 'ledger.sqlite') as db:
-                    db.execute('INSERT INTO recoveries VALUES (1,?,?,?,?,?,?,?)', (
-                        'synthetic-test-authorization', canonical(self.now).decode(), '["clock_error"]',
-                        self.boot, 10000.0, 100.0, 'clock_reanchor',
-                    ))
+                    db.execute(
+                        'INSERT INTO recoveries VALUES (1,?,?,?,?,?,?,?)',
+                        (
+                            'synthetic-test-authorization',
+                            canonical(self.now).decode(),
+                            '["clock_error"]',
+                            self.boot,
+                            10000.0,
+                            100.0,
+                            'clock_reanchor',
+                        ),
+                    )
                     db.execute(f'UPDATE recoveries SET {field}=?', (value,))
                 calls = []
                 reopened = self.api.open_store(root, manifest=manifest, mode='synthetic')
-                outcome = store.run_engine('bing', caller='probe', deadline_mono=103.0,
-                                           build=lambda: calls.append('build'),
-                                           send=lambda context, request: calls.append('send'),
-                                           parse=lambda response: calls.append('parse') or [])
-                self.assertEqual((getattr(reopened, 'reason', None), getattr(outcome, 'reason', None), calls),
-                                 ('schema_error', 'schema_error', []))
+                outcome = store.run_engine(
+                    'bing',
+                    caller='probe',
+                    deadline_mono=103.0,
+                    build=lambda: calls.append('build'),
+                    send=lambda context, request: calls.append('send'),
+                    parse=lambda response: calls.append('parse') or [],
+                )
+                self.assertEqual(
+                    (getattr(reopened, 'reason', None), getattr(outcome, 'reason', None), calls),
+                    ('schema_error', 'schema_error', []),
+                )
 
     def test_valid_recovery_audit_is_preserved_and_does_not_deny_normal_dispatch(self):
         old_checkpoint = '{"wall":9000.0, "mono":80.0, "boot":"synthetic-old-boot"}'
         old_poison = '["clock_error","legacy_reason","clock_error"]'
         with sqlite3.connect(self.root / 'ledger.sqlite') as db:
-            db.execute('INSERT INTO recoveries VALUES (1,?,?,?,?,?,?,?)', (
-                'synthetic-test-authorization', old_checkpoint, old_poison,
-                self.boot, 10000.0, 100.0, 'combined',
-            ))
+            db.execute(
+                'INSERT INTO recoveries VALUES (1,?,?,?,?,?,?,?)',
+                (
+                    'synthetic-test-authorization',
+                    old_checkpoint,
+                    old_poison,
+                    self.boot,
+                    10000.0,
+                    100.0,
+                    'combined',
+                ),
+            )
         self.assertEqual(self.attempt().outcome, 'empty')
         with sqlite3.connect(self.root / 'ledger.sqlite') as db:
-            self.assertEqual(db.execute('SELECT old_checkpoint,old_poison_json FROM recoveries').fetchall(),
-                             [(old_checkpoint, old_poison)])
+            self.assertEqual(
+                db.execute('SELECT old_checkpoint,old_poison_json FROM recoveries').fetchall(),
+                [(old_checkpoint, old_poison)],
+            )
             self.assertEqual(db.execute('SELECT reason FROM poison').fetchall(), [])
             self.assertEqual(db.execute('SELECT count(*) FROM attempts').fetchone()[0], 1)
 
@@ -1235,12 +1653,18 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
             db.execute('ALTER TABLE attempts ADD COLUMN unreviewed_schema TEXT')
         calls = []
         result = self.api.open_store(self.root, manifest=self.manifest, mode='synthetic')
-        outcome = store.run_engine('bing', caller='probe', deadline_mono=self.now['mono'] + 3,
-                                   build=lambda: calls.append('build'),
-                                   send=lambda context, request: calls.append('send'),
-                                   parse=lambda response: calls.append('parse') or [])
-        self.assertEqual((getattr(result, 'reason', None), getattr(outcome, 'reason', None), calls),
-                         ('schema_error', 'schema_error', []))
+        outcome = store.run_engine(
+            'bing',
+            caller='probe',
+            deadline_mono=self.now['mono'] + 3,
+            build=lambda: calls.append('build'),
+            send=lambda context, request: calls.append('send'),
+            parse=lambda response: calls.append('parse') or [],
+        )
+        self.assertEqual(
+            (getattr(result, 'reason', None), getattr(outcome, 'reason', None), calls),
+            ('schema_error', 'schema_error', []),
+        )
 
     def test_fixed_schema_rejects_changed_objects_types_constraints_and_indices(self):
         mutations = [
@@ -1277,18 +1701,33 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
 
         store = self.open()
         for _ in range(6):
-            result = store.run_engine('bing', caller='native_search', deadline_mono=103.0,
-                                      build=build, send=lambda context, request: None, parse=lambda response: [])
+            result = store.run_engine(
+                'bing',
+                caller='native_search',
+                deadline_mono=103.0,
+                build=build,
+                send=lambda context, request: None,
+                parse=lambda response: [],
+            )
             self.assertEqual(result.outcome, 'request_refused')
             self.assertEqual(result.reservations, 1)
         reopened = self.open()
-        seventh = reopened.run_engine('bing', caller='native_search', deadline_mono=103.0,
-                                     build=build, send=lambda context, request: None, parse=lambda response: [])
+        seventh = reopened.run_engine(
+            'bing',
+            caller='native_search',
+            deadline_mono=103.0,
+            build=build,
+            send=lambda context, request: None,
+            parse=lambda response: [],
+        )
         self.assertEqual(seventh.reason, 'engine_rate')
 
-    def attempt(self, engine='bing', *, build=lambda: None, parse=lambda response: [], send=lambda context, request: None):
-        return self.open().run_engine(engine, caller='native_search', deadline_mono=self.now['mono'] + 3,
-                                      build=build, send=send, parse=parse)
+    def attempt(
+        self, engine='bing', *, build=lambda: None, parse=lambda response: [], send=lambda context, request: None
+    ):
+        return self.open().run_engine(
+            engine, caller='native_search', deadline_mono=self.now['mono'] + 3, build=build, send=send, parse=parse
+        )
 
     def advance(self, seconds):
         self.now['wall'] += seconds
@@ -1303,16 +1742,25 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
     def test_unknown_engine_and_deadline_refuse_before_callbacks(self):
         def forbidden():
             self.fail('refused attempt called build')
+
         self.assertEqual(self.attempt('unreviewed', build=forbidden).reason, 'capability_refused')
-        result = self.open().run_engine('bing', caller='native_search', deadline_mono=self.now['mono'],
-                                       build=forbidden, send=lambda context, request: None, parse=lambda response: [])
+        result = self.open().run_engine(
+            'bing',
+            caller='native_search',
+            deadline_mono=self.now['mono'],
+            build=forbidden,
+            send=lambda context, request: None,
+            parse=lambda response: [],
+        )
         self.assertEqual(result.reason, 'deadline_exceeded')
 
     def test_finished_accounting_keeps_delayed_failure_in_window(self):
         for _ in range(5):
             self.assertEqual(self.attempt().outcome, 'empty')
+
         def delayed():
             self.advance(60)
+
         last = self.attempt(build=delayed)
         self.assertEqual(last.outcome, 'timeout')
         self.assertEqual(last.elapsed_s, 60)
@@ -1334,12 +1782,17 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
         self.api.initialize_fixture(root, registry=engines, clock=lambda: dict(self.now))
         manifest = fixture_manifest(root, engines)
         calls = []
+
         def attempt(name, caller='probe'):
             return self.api.open_store(root, manifest=manifest, mode='synthetic').run_engine(
-                name, caller=caller, deadline_mono=self.now['mono'] + 3,
-                build=lambda: calls.append(name), send=lambda context, request: None,
+                name,
+                caller=caller,
+                deadline_mono=self.now['mono'] + 3,
+                build=lambda: calls.append(name),
+                send=lambda context, request: None,
                 parse=lambda response: [],
             )
+
         for number in range(5):
             for ordinal in range(6):
                 name = f'fixture-domestic-{number}' + ('-alias' if ordinal % 2 else '')
@@ -1356,14 +1809,27 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
         self.assertEqual(len(calls), 31)
         with sqlite3.connect(root / 'ledger.sqlite') as db:
             self.assertEqual(db.execute('SELECT count(*) FROM attempts').fetchone()[0], 31)
-            self.assertEqual(db.execute('SELECT engine,stamp,account_mono FROM attempts ORDER BY attempt_id DESC LIMIT 1')
-                             .fetchone(), ('fixture-domestic-5', 160.0, 160.0))
+            self.assertEqual(
+                db.execute(
+                    'SELECT engine,stamp,account_mono FROM attempts ORDER BY attempt_id DESC LIMIT 1'
+                ).fetchone(),
+                ('fixture-domestic-5', 160.0, 160.0),
+            )
 
     def test_invalid_current_clock_persists_poison_before_any_callback(self):
         invalid = [
-            ('wall', float('nan')), ('wall', float('inf')), ('wall', -1.0), ('wall', True),
-            ('mono', float('nan')), ('mono', float('inf')), ('mono', -1.0), ('mono', True),
-            ('wall', 9999.0), ('mono', 99.0), ('wall', 10002.001), ('mono', 102.001),
+            ('wall', float('nan')),
+            ('wall', float('inf')),
+            ('wall', -1.0),
+            ('wall', True),
+            ('mono', float('nan')),
+            ('mono', float('inf')),
+            ('mono', -1.0),
+            ('mono', True),
+            ('wall', 9999.0),
+            ('mono', 99.0),
+            ('wall', 10002.001),
+            ('mono', 102.001),
         ]
         for number, (field, value) in enumerate(invalid):
             with self.subTest(field=field, value=value):
@@ -1374,10 +1840,14 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
                 store = self.api.open_store(root, manifest=manifest, mode='synthetic')
                 calls = []
                 self.now[field] = value
-                result = store.run_engine('bing', caller='probe', deadline_mono=103.0,
-                                          build=lambda: calls.append('build'),
-                                          send=lambda context, request: calls.append('send'),
-                                          parse=lambda response: calls.append('parse') or [])
+                result = store.run_engine(
+                    'bing',
+                    caller='probe',
+                    deadline_mono=103.0,
+                    build=lambda: calls.append('build'),
+                    send=lambda context, request: calls.append('send'),
+                    parse=lambda response: calls.append('parse') or [],
+                )
                 self.assertEqual(getattr(result, 'reason', None), 'clock_error')
                 self.assertEqual(calls, [])
                 self.now.update(wall=10000.0, mono=100.0)
@@ -1385,7 +1855,8 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
                     self.assertEqual(db.execute('SELECT reason FROM poison').fetchall(), [('clock_error',)])
                     self.assertEqual(db.execute('SELECT count(*) FROM attempts').fetchone()[0], 0)
                 snapshot = self.api.open_store(root, manifest=manifest, mode='synthetic').public_snapshot(
-                    manifest['artifact_digest'], manifest['config_digest'])
+                    manifest['artifact_digest'], manifest['config_digest']
+                )
                 self.assertEqual(snapshot.reason, 'clock_error')
 
     def test_changed_boot_poison_does_not_expire_or_refund_charge(self):
@@ -1398,8 +1869,9 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
         self.assertEqual(calls, [])
         with sqlite3.connect(self.root / 'ledger.sqlite') as db:
             self.assertEqual(db.execute('SELECT reason FROM poison').fetchall(), [('clock_error',)])
-            self.assertEqual(db.execute('SELECT engine,outcome,account_mono FROM attempts').fetchall(),
-                             [('bing', 'empty', 100.0)])
+            self.assertEqual(
+                db.execute('SELECT engine,outcome,account_mono FROM attempts').fetchall(), [('bing', 'empty', 100.0)]
+            )
             # Repairing the raw checkpoint cannot silently clear the poison.
             db.execute('UPDATE state SET checkpoint=?', (canonical(self.now).decode(),))
         self.advance(3600)
@@ -1409,17 +1881,22 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
     def test_parser_failure_and_empty_keep_captcha_strikes_across_reopen(self):
         def challenged(response):
             raise self.api.EngineFailure('captcha', suspension_s=900)
+
         for strikes, pause in [(1, 1800), (2, 3600), (3, 7200)]:
             result = self.attempt('quark', parse=challenged)
             self.assertEqual(result.outcome, 'captcha')
             self.assertEqual(self.attempt('quark').reason, 'cooldown')
             self.advance(pause)
             self.assertEqual(self.attempt('quark').outcome, 'empty')
+
             def broken(response):
                 raise ValueError('synthetic parser error')
+
             self.assertEqual(self.attempt('quark', parse=broken).outcome, 'parser_error')
             with sqlite3.connect(self.root / 'ledger.sqlite') as db:
-                self.assertEqual(db.execute('SELECT strikes FROM pauses WHERE engine=?', ('quark',)).fetchone()[0], strikes)
+                self.assertEqual(
+                    db.execute('SELECT strikes FROM pauses WHERE engine=?', ('quark',)).fetchone()[0], strikes
+                )
         self.assertEqual(self.attempt('quark', parse=lambda response: [{'title': 'synthetic'}]).outcome, 'ok')
         with sqlite3.connect(self.root / 'ledger.sqlite') as db:
             self.assertEqual(db.execute('SELECT count(*) FROM pauses').fetchone()[0], 0)
@@ -1471,14 +1948,21 @@ print(json.dumps({'parent_outcome': result.outcome}), flush=True)
 '''
         process = subprocess.run(
             [sys.executable, '-S', '-c', script, str(self.root), json.dumps(self.manifest)],
-            cwd=WORKSPACE, capture_output=True, text=True, timeout=5, check=False,
+            cwd=WORKSPACE,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
         )
         self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
         records = [json.loads(line) for line in process.stdout.splitlines()]
-        self.assertEqual(records, [
-            {'child_reason': 'capability_refused', 'fresh_reason': 'lock_busy', 'reused_fd_open': True},
-            {'parent_outcome': 'empty'},
-        ])
+        self.assertEqual(
+            records,
+            [
+                {'child_reason': 'capability_refused', 'fresh_reason': 'lock_busy', 'reused_fd_open': True},
+                {'parent_outcome': 'empty'},
+            ],
+        )
         with sqlite3.connect(self.root / 'ledger.sqlite') as db:
             self.assertEqual(db.execute('SELECT engine,outcome FROM attempts').fetchall(), [('bing', 'empty')])
             self.assertEqual(db.execute('SELECT reason FROM poison').fetchall(), [])
@@ -1512,11 +1996,16 @@ store.run_engine('bing', caller='probe', deadline_mono=103.0,
 '''
         process = subprocess.Popen(
             [sys.executable, '-S', '-c', script, str(self.root), json.dumps(self.manifest)],
-            cwd=WORKSPACE, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            cwd=WORKSPACE,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
         )
         child = None
         try:
             import select
+
             self.assertTrue(select.select([process.stdout], [], [], 5)[0], 'owner never entered build')
             child = int(process.stdout.readline())
             self.assertEqual(getattr(self.open(), 'reason', None), 'lock_busy')
@@ -1527,8 +2016,7 @@ store.run_engine('bing', caller='probe', deadline_mono=103.0,
             os.kill(child, 0)
             self.assertNotEqual(getattr(self.open(), 'reason', None), 'lock_busy')
             calls = []
-            self.assertEqual(self.attempt('quark', build=lambda: calls.append('build')).reason,
-                             'unfinished_attempt')
+            self.assertEqual(self.attempt('quark', build=lambda: calls.append('build')).reason, 'unfinished_attempt')
             self.assertEqual(calls, [])
             with sqlite3.connect(self.root / 'ledger.sqlite') as db:
                 self.assertEqual(db.execute('SELECT engine,outcome FROM attempts').fetchall(), [('bing', None)])
@@ -1548,21 +2036,37 @@ store.run_engine('bing', caller='probe', deadline_mono=103.0,
         artifact, config = self.manifest['artifact_digest'], self.manifest['config_digest']
         receipt = store.claim_release(release_id, artifact, config, self.now['mono'] + 10)
         calls = []
+
         def operation():
             calls.append('operation')
             self.assertEqual(self.open().consume_release_ingress(release_id, artifact, config), True)
-            self.assertEqual(self.open().consume_release_ingress(release_id, artifact, config).reason, 'release_consumed')
+            self.assertEqual(
+                self.open().consume_release_ingress(release_id, artifact, config).reason, 'release_consumed'
+            )
             return {
-                'version': 2, 'release_id': release_id, 'artifact_digest': artifact, 'config_digest': config,
-                'checked_at': '1970-01-01T02:46:40+00:00', 'age_s': 0,
-                'search': {'status': 'passed', 'result_count': 2, 'responsive_engine_count': 2,
-                           'protection_status': 'complete', 'quality_evidence_digest': 'b' * 64, 'reason': None},
+                'version': 2,
+                'release_id': release_id,
+                'artifact_digest': artifact,
+                'config_digest': config,
+                'checked_at': '1970-01-01T02:46:40+00:00',
+                'age_s': 0,
+                'search': {
+                    'status': 'passed',
+                    'result_count': 2,
+                    'responsive_engine_count': 2,
+                    'protection_status': 'complete',
+                    'quality_evidence_digest': 'b' * 64,
+                    'reason': None,
+                },
                 'egress': {'status': 'passed', 'reason': None},
             }
+
         evidence = store.run_release_check(receipt, operation)
         self.assertEqual(evidence['search']['status'], 'passed')
         self.assertEqual(store.run_release_check(receipt, operation).reason, 'release_consumed')
-        self.assertEqual(self.open().claim_release(release_id, artifact, config, self.now['mono'] + 10).reason, 'release_consumed')
+        self.assertEqual(
+            self.open().claim_release(release_id, artifact, config, self.now['mono'] + 10).reason, 'release_consumed'
+        )
         self.assertEqual(calls, ['operation'])
         self.assertEqual(self.open().public_snapshot(artifact, config)['age_s'], 0)
         self.advance(60.001)
@@ -1573,9 +2077,11 @@ store.run_engine('bing', caller='probe', deadline_mono=103.0,
         artifact, config = self.manifest['artifact_digest'], self.manifest['config_digest']
         release_id = '2' * 32
         receipt = store.claim_release(release_id, artifact, config, self.now['mono'] + 10)
+
         def operation():
             self.assertEqual(self.open().consume_release_ingress(release_id, artifact, config), True)
             raise ValueError('synthetic operation failure')
+
         self.assertEqual(store.run_release_check(receipt, operation).reason, 'evidence_unknown')
         self.assertEqual(self.open().consume_release_ingress(release_id, artifact, config).reason, 'release_consumed')
         self.assertEqual(self.open().public_snapshot(artifact, config).reason, 'evidence_unknown')
@@ -1603,8 +2109,9 @@ store.run_engine('bing', caller='probe', deadline_mono=103.0,
             {**self.manifest, 'python_digest': '0' * 64},
         ]:
             with self.subTest(manifest=list(manifest)):
-                self.assertEqual(self.api.open_store(self.root, manifest=manifest, mode='synthetic').reason,
-                                 'provenance_error')
+                self.assertEqual(
+                    self.api.open_store(self.root, manifest=manifest, mode='synthetic').reason, 'provenance_error'
+                )
 
 
 def _install_offline_test_guard():
@@ -1643,7 +2150,7 @@ def _install_offline_test_guard():
             raise AssertionError('offline test denied external DNS')
         return original_resolve(host, *args, **kwargs)
 
-    def unexpected_skip(result, test, reason):
+    def unexpected_skip(self, test, reason):
         raise AssertionError(f'unexpected offline test skip: {test.id()}: {reason}')
 
     socket.socket = LoopbackSocket
@@ -1662,7 +2169,7 @@ def _install_offline_test_guard():
             self.end_headers()
             self.wfile.write(body)
 
-        def log_message(self, *args):
+        def log_message(self, format, *args):
             pass
 
     server = ThreadingHTTPServer(('127.0.0.1', 0), RulesHandler)
@@ -1698,16 +2205,27 @@ def _offline_test_main(arguments):
     print(f'offline_head={head}', flush=True)
 
     if arguments[0] == '--make':
-        allowed = {'test.unit', 'ci.test', 'test.pylint', 'test.rst', 'test.pybabel',
-                   'test.shell', 'test.shfmt', 'test.pyright_modified'}
+        allowed = {
+            'test.unit',
+            'ci.test',
+            'test.pylint',
+            'test.rst',
+            'test.pybabel',
+            'test.shell',
+            'test.shfmt',
+            'test.pyright_modified',
+        }
         if len(arguments) != 2 or arguments[1] not in allowed:
             raise ValueError('unsupported offline Make target')
         with tempfile.TemporaryDirectory(dir=tmp) as directory:
             Path(directory, 'sitecustomize.py').symlink_to(Path(__file__).resolve())
-            env = {**os.environ, 'WAG_TEST_OFFLINE': '1',
-                   'PYTHONPATH': os.pathsep.join((directory, str(WORKSPACE))),
-                   'PY_ENV': str(Path(sys.executable).parent.parent),
-                   'PY_ENV_REQ': 'requirements.txt requirements-dev.txt'}
+            env = {
+                **os.environ,
+                'WAG_TEST_OFFLINE': '1',
+                'PYTHONPATH': os.pathsep.join((directory, str(WORKSPACE))),
+                'PY_ENV': str(Path(sys.executable).parent.parent),
+                'PY_ENV_REQ': 'requirements.txt requirements-dev.txt',
+            }
             return subprocess.run(['make', 'V=1', arguments[1]], cwd=WORKSPACE, env=env, check=False).returncode
 
     if arguments != ['--offline']:
@@ -1715,19 +2233,37 @@ def _offline_test_main(arguments):
     _install_offline_test_guard()
     import importlib.metadata
 
-    paths = subprocess.check_output(['git', 'ls-files', '-z', 'wag_protection', 'searx', 'tests',
-                                     'setup.py', 'requirements*', '.github/workflows/integration.yml'], cwd=WORKSPACE)
-    source = {name: hashlib.sha256((WORKSPACE / name).read_bytes()).hexdigest()
-              for name in paths.decode().split('\0') if name and (WORKSPACE / name).is_file()}
+    paths = subprocess.check_output(
+        [
+            'git',
+            'ls-files',
+            '-z',
+            'wag_protection',
+            'searx',
+            'tests',
+            'setup.py',
+            'requirements*',
+            '.github/workflows/integration.yml',
+        ],
+        cwd=WORKSPACE,
+    )
+    source = {
+        name: hashlib.sha256((WORKSPACE / name).read_bytes()).hexdigest()
+        for name in paths.decode().split('\0')
+        if name and (WORKSPACE / name).is_file()
+    }
     dependencies = {}
     for distribution in importlib.metadata.distributions():
         files = {}
         for file in distribution.files or ():
-            path = distribution.locate_file(file)
+            path = Path(str(distribution.locate_file(file)))
             if path.is_file() and path.suffix != '.pyc':
                 files[str(file)] = hashlib.sha256(path.read_bytes()).hexdigest()
         dependencies[distribution.metadata['Name']] = {'version': distribution.version, 'files_digest': digest(files)}
-    print('offline_artifact=' + canonical({'head': head, 'source': source, 'dependencies': dependencies}).decode(), flush=True)
+    print(
+        'offline_artifact=' + canonical({'head': head, 'source': source, 'dependencies': dependencies}).decode(),
+        flush=True,
+    )
 
     positive = 'tests.unit.network.test_protected.ProtectedTransportTest.test_native_search_two_engines_same_query_complete_nonempty'
 
@@ -1739,13 +2275,24 @@ def _offline_test_main(arguments):
             if test.id() == positive:
                 self.native_headers += test.tls_server.headers
 
-    names = ['tests.unit.test_wag_protection', 'tests.unit.network.test_protected',
-             'tests.unit.network.test_network', 'tests.unit.test_search', 'tests.unit.test_results',
-             'tests.unit.test_webutils', 'tests.unit.test_webapp']
+    names = [
+        'tests.unit.test_wag_protection',
+        'tests.unit.network.test_protected',
+        'tests.unit.network.test_network',
+        'tests.unit.test_search',
+        'tests.unit.test_results',
+        'tests.unit.test_webutils',
+        'tests.unit.test_webapp',
+    ]
     suite = unittest.defaultTestLoader.loadTestsFromNames(names)
     result = unittest.TextTestRunner(verbosity=2, resultclass=OfflineResult).run(suite)
-    print(f'offline_tests={result.testsRun} native_positive_headers={result.native_headers} unexpected_skips={len(result.skipped)}', flush=True)
-    return 0 if result.wasSuccessful() and result.testsRun > 0 and result.native_headers > 0 and not result.skipped else 1
+    print(
+        f'offline_tests={result.testsRun} native_positive_headers={result.native_headers} unexpected_skips={len(result.skipped)}',
+        flush=True,
+    )
+    return (
+        0 if result.wasSuccessful() and result.testsRun > 0 and result.native_headers > 0 and not result.skipped else 1
+    )
 
 
 if __name__ == 'sitecustomize' and os.environ.get('WAG_TEST_OFFLINE') == '1':

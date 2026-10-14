@@ -15,9 +15,12 @@ class TestWebUtils(SearxTestCase):
 
         query = SearchQuery('offline compatibility', [])
         response = webutils.get_json_response(query, ResultContainer())
-        self.assertEqual(response, '{"query": "offline compatibility", "results": [], "answers": [], '
-                                   '"corrections": [], "infoboxes": [], "suggestions": [], '
-                                   '"unresponsive_engines": []}')
+        self.assertEqual(
+            response,
+            '{"query": "offline compatibility", "results": [], "answers": [], '
+            '"corrections": [], "infoboxes": [], "suggestions": [], '
+            '"unresponsive_engines": []}',
+        )
 
     @parameterized.expand(
         [

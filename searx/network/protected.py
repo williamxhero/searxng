@@ -2,6 +2,7 @@
 """Pinned native HTTP/1.1 transport with adjacent durable connect/header gates."""
 
 import asyncio
+from collections.abc import AsyncIterator, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 import ipaddress
 from importlib.metadata import PackageNotFoundError
@@ -9,8 +10,10 @@ from pathlib import Path
 import select
 import socket
 import ssl
+from typing import Protocol, TypedDict, cast
 
 import httpcore
+from httpcore._backends.base import SOCKET_OPTION
 import httpx
 
 from wag_protection import ProtectionError, Refusal, open_store, validate_settings
@@ -18,19 +21,43 @@ from wag_protection.contract import json_digest, load_json, validate_manifest
 from wag_protection.ledger import CURRENT_DISPATCH, _commit
 
 
-ENGINE_CONFIG_FIELDS = frozenset((
-    'name', 'engine', 'categories', 'shortcut', 'timeout', 'disabled', 'inactive', 'weight',
-    'language_support', 'quark_category', 'chinaso_news_source', 'search_type',
-))
+ENGINE_CONFIG_FIELDS = frozenset(
+    (
+        'name',
+        'engine',
+        'categories',
+        'shortcut',
+        'timeout',
+        'disabled',
+        'inactive',
+        'weight',
+        'language_support',
+        'quark_category',
+        'chinaso_news_source',
+        'search_type',
+    )
+)
 NETWORK_CONFIG_FIELDS = (
-    'enable_http', 'verify', 'enable_http2', 'pool_connections', 'pool_maxsize', 'keepalive_expiry',
-    'source_ips', 'local_addresses', 'using_tor_proxy', 'max_redirects', 'retries', 'retry_on_http_error',
-    'request_timeout', 'max_request_timeout',
+    'enable_http',
+    'verify',
+    'enable_http2',
+    'pool_connections',
+    'pool_maxsize',
+    'keepalive_expiry',
+    'source_ips',
+    'local_addresses',
+    'using_tor_proxy',
+    'max_redirects',
+    'retries',
+    'retry_on_http_error',
+    'request_timeout',
+    'max_request_timeout',
 )
 
 
 def resolved_config_digest(engine_settings, outgoing):
     """Hash only current resolved, nonsecret settings, never the manifest's assertion."""
+
     def network_projection(value):
         result = {key: value[key] for key in NETWORK_CONFIG_FIELDS if key in value}
         proxies = value.get('proxies') or {}
@@ -46,8 +73,10 @@ def resolved_config_digest(engine_settings, outgoing):
         return result
 
     projection = {
-        'engines': [{key: engine[key] for key in sorted(ENGINE_CONFIG_FIELDS) if key in engine}
-                    for engine in sorted(engine_settings, key=lambda item: item['name'])],
+        'engines': [
+            {key: engine[key] for key in sorted(ENGINE_CONFIG_FIELDS) if key in engine}
+            for engine in sorted(engine_settings, key=lambda item: item['name'])
+        ],
         'outgoing': network_projection(outgoing),
         'networks': {name: network_projection(value) for name, value in sorted(outgoing.get('networks', {}).items())},
     }
@@ -89,9 +118,14 @@ def protection_descriptor():
         config = validate_settings(settings['outgoing'].get('wag_protection', {'enabled': False}))
         if not config['enabled']:
             return descriptor
-        descriptor.update(enabled=True, artifact_digest=None, registry_digest=None,
-                          config_digest=resolved_config_digest(settings['engines'], settings['outgoing']),
-                          admission='blocked', reason='provenance_error')
+        descriptor.update(
+            enabled=True,
+            artifact_digest=None,
+            registry_digest=None,
+            config_digest=resolved_config_digest(settings['engines'], settings['outgoing']),
+            admission='blocked',
+            reason='provenance_error',
+        )
         with Path(config['artifact_manifest']).open('rb') as file:
             raw = file.read(128 * 1024 + 1)
         if len(raw) > 128 * 1024:
@@ -118,10 +152,14 @@ def validate_engine_settings(engine_data):
     if isinstance(store, Refusal):
         raise ProtectionError(store.reason)
     approved = next((entry for entry in store.manifest['registry'] if entry['engine'] == engine_data.get('name')), None)
-    if (approved is None or approved['module'] != engine_data.get('engine')
-            or approved['profile']['live_hold'] or set(engine_data) - ENGINE_CONFIG_FIELDS
-            or {key: value for key, value in engine_data.items() if key not in ('name', 'engine')}
-            != approved['profile'].get('settings')):
+    if (
+        approved is None
+        or approved['module'] != engine_data.get('engine')
+        or approved['profile']['live_hold']
+        or set(engine_data) - ENGINE_CONFIG_FIELDS
+        or {key: value for key, value in engine_data.items() if key not in ('name', 'engine')}
+        != approved['profile'].get('settings')
+    ):
         raise ProtectionError('capability_refused')
     return approved
 
@@ -140,23 +178,28 @@ def _dispatch():
     return context
 
 
-def _remaining(timeout=None):
+def _remaining(timeout: float | None = None) -> float:
     context = _dispatch()
     remaining = context.deadline - asyncio.get_running_loop().time()
     return remaining if timeout is None else min(remaining, timeout)
 
 
 @contextmanager
-def _map_errors():
+def _map_errors() -> Iterator[None]:
     try:
         yield
     except (httpcore.TimeoutException, httpcore.NetworkError, httpcore.ProtocolError, httpcore.ProxyError) as error:
         for core, native in (
-            (httpcore.ConnectTimeout, httpx.ConnectTimeout), (httpcore.ReadTimeout, httpx.ReadTimeout),
-            (httpcore.WriteTimeout, httpx.WriteTimeout), (httpcore.PoolTimeout, httpx.PoolTimeout),
-            (httpcore.ConnectError, httpx.ConnectError), (httpcore.ReadError, httpx.ReadError),
-            (httpcore.WriteError, httpx.WriteError), (httpcore.RemoteProtocolError, httpx.RemoteProtocolError),
-            (httpcore.LocalProtocolError, httpx.LocalProtocolError), (httpcore.ProxyError, httpx.ProxyError),
+            (httpcore.ConnectTimeout, httpx.ConnectTimeout),
+            (httpcore.ReadTimeout, httpx.ReadTimeout),
+            (httpcore.WriteTimeout, httpx.WriteTimeout),
+            (httpcore.PoolTimeout, httpx.PoolTimeout),
+            (httpcore.ConnectError, httpx.ConnectError),
+            (httpcore.ReadError, httpx.ReadError),
+            (httpcore.WriteError, httpx.WriteError),
+            (httpcore.RemoteProtocolError, httpx.RemoteProtocolError),
+            (httpcore.LocalProtocolError, httpx.LocalProtocolError),
+            (httpcore.ProxyError, httpx.ProxyError),
         ):
             if isinstance(error, core):
                 raise native('protected transport failure') from None
@@ -164,7 +207,9 @@ def _map_errors():
 
 
 class GuardedStream(httpcore.AsyncNetworkStream):
-    def __init__(self, reader, writer, root):
+    """Actual asyncio stream bound to the current durable dispatch."""
+
+    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, root: Path) -> None:
         self.reader = reader
         self.writer = writer
         self.root = root
@@ -175,7 +220,7 @@ class GuardedStream(httpcore.AsyncNetworkStream):
             raise ProtectionError('provenance_error')
         return context
 
-    async def read(self, max_bytes, timeout=None):
+    async def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
         self.context()
         try:
             async with asyncio.timeout(_remaining(timeout)):
@@ -185,7 +230,7 @@ class GuardedStream(httpcore.AsyncNetworkStream):
         except OSError:
             raise httpcore.ReadError() from None
 
-    async def write(self, buffer, timeout=None):
+    async def write(self, buffer: bytes, timeout: float | None = None) -> None:
         context = self.context()
         if context.armed_row is None:
             raise ProtectionError('capability_refused')
@@ -198,19 +243,22 @@ class GuardedStream(httpcore.AsyncNetworkStream):
         except OSError:
             raise httpcore.WriteError() from None
 
-    async def aclose(self):
+    async def aclose(self) -> None:
         # This connection is terminal, not reusable. Graceful TLS shutdown can
         # wait for a peer beyond the shared deadline; abort closes the socket
         # locally, and wait_closed still proves connection_lost before Task done.
         self.writer.transport.abort()
         await self.writer.wait_closed()
 
-    async def start_tls(self, ssl_context, server_hostname=None, timeout=None):
+    async def start_tls(
+        self, ssl_context: ssl.SSLContext, server_hostname: str | None = None, timeout: float | None = None
+    ) -> 'GuardedStream':
         self.context()
         try:
             async with asyncio.timeout(_remaining(timeout)):
-                await self.writer.start_tls(ssl_context, server_hostname=server_hostname,
-                                            ssl_handshake_timeout=_remaining(timeout))
+                await self.writer.start_tls(
+                    ssl_context, server_hostname=server_hostname, ssl_handshake_timeout=_remaining(timeout)
+                )
             return self
         except TimeoutError:
             await self.aclose()
@@ -222,7 +270,7 @@ class GuardedStream(httpcore.AsyncNetworkStream):
             await self.aclose()
             raise
 
-    def get_extra_info(self, info):
+    def get_extra_info(self, info: str) -> object:
         if info == 'is_readable':
             sock = self.writer.get_extra_info('socket')
             return self.writer.is_closing() or bool(select.select([sock], [], [], 0)[0])
@@ -230,7 +278,16 @@ class GuardedStream(httpcore.AsyncNetworkStream):
 
 
 class GuardedBackend(httpcore.AsyncNetworkBackend):
-    async def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
+    """Pinned httpcore backend with exactly one numeric OS connect."""
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Iterable[SOCKET_OPTION] | None = None,
+    ) -> GuardedStream:
         context = _dispatch()
         if context.connections:
             raise ProtectionError('protocol_retry_refused')
@@ -252,7 +309,12 @@ class GuardedBackend(httpcore.AsyncNetworkBackend):
                 if local_address is not None:
                     sock.bind((local_address, 0))
                 for option in socket_options or ():
-                    sock.setsockopt(*option)
+                    if len(option) == 4:
+                        level, name, value, length = option
+                        sock.setsockopt(level, name, value, length)
+                    else:
+                        level, name, value = option
+                        sock.setsockopt(level, name, value)
                 context.check_deadline()
                 context.db.execute('UPDATE attempts SET connection_attempted=1 WHERE attempt_id=?', (context.rows[0],))
                 _commit(context.db, context.store.root)
@@ -270,37 +332,79 @@ class GuardedBackend(httpcore.AsyncNetworkBackend):
             if sock is not None:
                 sock.close()
 
-    async def connect_unix_socket(self, path, timeout=None, socket_options=None):
+    async def connect_unix_socket(
+        self, path: str, timeout: float | None = None, socket_options: Iterable[SOCKET_OPTION] | None = None
+    ) -> httpcore.AsyncNetworkStream:
         raise ProtectionError('route_unsupported')
 
-    async def sleep(self, seconds):
+    async def sleep(self, seconds: float) -> None:
         raise ProtectionError('protocol_retry_refused')
 
 
+class CoreResponseStream(Protocol):
+    """Streaming interface returned by the pinned async httpcore pool."""
+
+    def __aiter__(self) -> AsyncIterator[bytes]: ...
+
+    async def aclose(self) -> None: ...
+
+
+class PoolOptions(TypedDict):
+    """Shared constructor keywords supported by both pinned async pool types."""
+
+    ssl_context: ssl.SSLContext
+    max_connections: int | None
+    max_keepalive_connections: int | None
+    keepalive_expiry: float | None
+    http1: bool
+    http2: bool
+    retries: int
+    local_address: str | None
+    network_backend: httpcore.AsyncNetworkBackend
+
+
 class ResponseStream(httpx.AsyncByteStream):
-    def __init__(self, stream):
+    """Map errors without replacing the actual httpcore body stream."""
+
+    def __init__(self, stream: CoreResponseStream) -> None:
         self.stream = stream
 
-    async def __aiter__(self):
+    async def __aiter__(self) -> AsyncIterator[bytes]:
         with _map_errors():
             async for chunk in self.stream:
                 yield chunk
 
-    async def aclose(self):
+    async def aclose(self) -> None:
         with _map_errors():
             await self.stream.aclose()
 
 
 class GuardedTransport(httpx.AsyncBaseTransport):
-    def __init__(self, *, verify=True, proxy=None, local_address=None, limits=None):
+    """Original pinned HTTP/1 pool with durable before-header accounting."""
+
+    def __init__(
+        self,
+        *,
+        verify: ssl.SSLContext | str | bool = True,
+        proxy: httpx.Proxy | httpx.URL | str | None = None,
+        local_address: str | None = None,
+        limits: httpx.Limits | None = None,
+    ) -> None:
         if httpx.__version__ != '0.28.1' or httpcore.__version__ != '1.0.9':
             raise ProtectionError('import_error')
         limits = limits or httpx.Limits()
         ssl_context = httpx.create_ssl_context(verify=verify, trust_env=False)
-        options = dict(ssl_context=ssl_context, max_connections=limits.max_connections,
-                       max_keepalive_connections=limits.max_keepalive_connections,
-                       keepalive_expiry=limits.keepalive_expiry, http1=True, http2=False,
-                       retries=0, local_address=local_address, network_backend=GuardedBackend())
+        options: PoolOptions = {
+            'ssl_context': ssl_context,
+            'max_connections': limits.max_connections,
+            'max_keepalive_connections': limits.max_keepalive_connections,
+            'keepalive_expiry': limits.keepalive_expiry,
+            'http1': True,
+            'http2': False,
+            'retries': 0,
+            'local_address': local_address,
+            'network_backend': GuardedBackend(),
+        }
         if proxy is None:
             self.pool = httpcore.AsyncConnectionPool(**options)
         else:
@@ -308,17 +412,20 @@ class GuardedTransport(httpx.AsyncBaseTransport):
             if proxy.url.scheme not in ('http', 'https'):
                 raise ProtectionError('route_unsupported')
             self.pool = httpcore.AsyncHTTPProxy(
-                proxy_url=httpcore.URL(scheme=proxy.url.raw_scheme, host=proxy.url.raw_host,
-                                       port=proxy.url.port, target=proxy.url.raw_path),
-                proxy_auth=proxy.raw_auth, proxy_headers=proxy.headers.raw,
-                proxy_ssl_context=proxy.ssl_context, **options,
+                proxy_url=httpcore.URL(
+                    scheme=proxy.url.raw_scheme, host=proxy.url.raw_host, port=proxy.url.port, target=proxy.url.raw_path
+                ),
+                proxy_auth=proxy.raw_auth,
+                proxy_headers=proxy.headers.raw,
+                proxy_ssl_context=proxy.ssl_context,
+                **options,
             )
 
-    async def trace(self, event, info):
+    async def trace(self, event: str, info: Mapping[str, object]) -> None:
         if event != 'http11.send_request_headers.started':
             return
         context = _dispatch()
-        method = info['request'].method
+        method = cast(httpcore.Request, info['request']).method
         if context.headers:
             if context.headers != 1 or not context.proxy_connect or method == b'CONNECT':
                 raise ProtectionError('protocol_retry_refused')
@@ -332,9 +439,11 @@ class GuardedTransport(httpx.AsyncBaseTransport):
         _commit(context.db, context.store.root)
         context.headers += 1
 
-    async def handle_async_request(self, request):
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         context = _dispatch()
-        if not callable(self.trace) or not isinstance(self.pool._network_backend, GuardedBackend):  # pylint: disable=protected-access
+        if not callable(self.trace) or not isinstance(
+            self.pool._network_backend, GuardedBackend
+        ):  # pylint: disable=protected-access
             raise ProtectionError('import_error')
         if context.main_calls:
             raise ProtectionError('redirect_refused')
@@ -346,15 +455,25 @@ class GuardedTransport(httpx.AsyncBaseTransport):
         request.extensions['timeout'] = {name: timeout for name in ('connect', 'read', 'write', 'pool')}
         core_request = httpcore.Request(
             method=request.method,
-            url=httpcore.URL(scheme=request.url.raw_scheme, host=request.url.raw_host,
-                             port=request.url.port, target=request.url.raw_path),
-            headers=request.headers.raw, content=request.stream, extensions=request.extensions,
+            url=httpcore.URL(
+                scheme=request.url.raw_scheme,
+                host=request.url.raw_host,
+                port=request.url.port,
+                target=request.url.raw_path,
+            ),
+            headers=request.headers.raw,
+            content=request.stream,
+            extensions=request.extensions,
         )
         with _map_errors():
             response = await self.pool.handle_async_request(core_request)
-        return httpx.Response(response.status, headers=response.headers, stream=ResponseStream(response.stream),
-                              extensions=response.extensions)
+        return httpx.Response(
+            response.status,
+            headers=response.headers,
+            stream=ResponseStream(cast(CoreResponseStream, response.stream)),
+            extensions=response.extensions,
+        )
 
-    async def aclose(self):
+    async def aclose(self) -> None:
         with _map_errors():
             await self.pool.aclose()

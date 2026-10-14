@@ -142,7 +142,12 @@ def get_transport_for_socks_proxy(
 
 
 def get_transport(
-    verify: bool, http2: bool, local_address: str, proxy_url: str | None, limit: httpx.Limits, retries: int,
+    verify: bool,
+    http2: bool,
+    local_address: str,
+    proxy_url: str | None,
+    limit: httpx.Limits,
+    retries: int,
     protected: bool = False,
 ):
     if protected:

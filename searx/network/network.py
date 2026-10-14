@@ -108,8 +108,9 @@ class Network:
         if self.protected:
             from wag_protection import ProtectionError  # pylint: disable=import-outside-toplevel
 
-            if self.using_tor_proxy or any(httpx.URL(url).scheme not in ('http', 'https')
-                                           for _, urls in self.iter_proxies() for url in urls):
+            if self.using_tor_proxy or any(
+                httpx.URL(url).scheme not in ('http', 'https') for _, urls in self.iter_proxies() for url in urls
+            ):
                 raise ProtectionError('route_unsupported')
         for address in self.iter_ipaddresses():
             if '/' in address:

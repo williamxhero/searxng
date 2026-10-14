@@ -17,19 +17,25 @@ class ResultContainerTestCase(SearxTestCase):
 
         container = ResultContainer()
         entered, release, closed = threading.Event(), threading.Event(), threading.Event()
+
         def on_result(_):
             entered.set()
             release.wait(3)
             return True
+
         container.on_result = on_result
         snapshot = {'status': 'unfinished', 'engines': [{'engine': 'bing', 'status': 'unfinished'}]}
         container.set_outbound_protection(snapshot)
         snapshot['engines'][0]['status'] = 'admitted'
-        worker = threading.Thread(target=container.extend, args=('google', [
-            dict(url='https://fixture.invalid/first', title='First', content='Synthetic')]))
+        worker = threading.Thread(
+            target=container.extend,
+            args=('google', [dict(url='https://fixture.invalid/first', title='First', content='Synthetic')]),
+        )
+
         def close():
             container.close()
             closed.set()
+
         closer = threading.Thread(target=close)
         worker.start()
         try:
